@@ -4,6 +4,8 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 import os
 import re
+import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 KEYWORDS = [
     r"api_key", r"password", r"secret", r"access_token", r"auth_token", r"bearer", r"jwt",
@@ -27,10 +29,31 @@ KEYWORDS = [
 ]
 
 PATH_PATTERN = r"[\"']\/(?:[a-zA-Z0-9\-_./]+)[\"']"
+CLOUD_PATTERNS = [
+    r"[a-zA-Z0-9\-_.]+\.s3\.amazonaws\.com",
+    r"[a-zA-Z0-9\-_.]+\.blob\.core\.windows\.net",
+    r"storage\.googleapis\.com\/[a-zA-Z0-9\-_.]+"
+]
 
 
-def scan_content(content, js_url):
-    print(f"\n[!] Scanning: {js_url}")
+TARGET_EXTENSIONS = ('.js', '.php', '.json', '.xml', '.config', '.yml', '.yaml', '.asp', '.aspx', '.jsp', '.env',
+                     '.sql', '.log', '.bak', '.properties', '.ini', '.conf')
+EXT_REGEX_STR = r"(?:js|php|json|xml|config|yml|yaml|asp|aspx|jsp|env|sql|log|bak|properties|ini|conf)"
+
+
+def calculate_entropy(data):
+    if not data:
+        return 0
+    entropy = 0
+    for x in range(256):
+        p_x = data.count(chr(x)) / len(data)
+        if p_x > 0:
+            entropy += - p_x * math.log2(p_x)
+    return entropy
+
+
+def scan_content(content, file_url):
+    print(f"\n[!] Scanning: {file_url}")
     found = False
 
     keyword_pattern = re.compile('|'.join(KEYWORDS), re.IGNORECASE)
@@ -39,6 +62,18 @@ def scan_content(content, js_url):
         start = max(0, match.start() - 30)
         end = min(len(content), match.end() + 30)
         print(f"  [FOUND KEYWORD] '{match.group()}' at: ...{content[start:end]}...")
+
+    for pattern in CLOUD_PATTERNS:
+        cloud_matches = re.finditer(pattern, content)
+        for match in cloud_matches:
+            found = True
+            print(f"  [FOUND CLOUD STORAGE] {match.group()}")
+
+    words = re.findall(r'[\"\']([a-zA-Z0-9\-_/+=]{16,})[\"\']', content)
+    for word in words:
+        if calculate_entropy(word) > 4.5:
+            found = True
+            print(f"  [HIGH ENTROPY SECRET] '{word}' (Entropy: {calculate_entropy(word):.2f})")
 
     path_matches = re.finditer(PATH_PATTERN, content)
     unique_paths = set()
@@ -56,7 +91,7 @@ def scan_content(content, js_url):
         print("  [+] No sensitive info or paths found.")
 
 
-def get_js_files(target_url):
+def get_target_files(target_url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(target_url, headers=headers, timeout=10)
@@ -66,36 +101,68 @@ def get_js_files(target_url):
             return []
 
         soup = BeautifulSoup(response.text, 'html.parser')
-        js_files = set()
+        target_files = set()
 
-        for script in soup.find_all('script'):
-            src = script.get('src')
-            if src:
-                full_url = urljoin(target_url, src)
-                js_files.add(full_url)
+        for tag in soup.find_all(['script', 'link', 'a', 'iframe']):
+            for attr in ['src', 'href', 'data-src', 'data-url']:
+                val = tag.get(attr)
+                if val:
+                    val_lower = val.lower()
+                    if val_lower.endswith(TARGET_EXTENSIONS) or any(
+                            ext in val_lower for ext in ['.js?', '.php?', '.json?']):
+                        if '.css' not in val_lower:
+                            full_url = urljoin(target_url, val)
+                            target_files.add(full_url)
 
-        js_list = list(js_files)
-        print(f"\n[+] Found {len(js_list)} JavaScript files:\n")
-        for i, js in enumerate(js_list, 1):
-            print(f"[{i}] {js}")
+        text_content = response.text
+        potential_paths = re.findall(rf"[\"']([a-zA-Z0-9\-_./]+\.{EXT_REGEX_STR})[\"']", text_content, re.IGNORECASE)
+        for p in potential_paths:
+            full_url = urljoin(target_url, p)
+            target_files.add(full_url)
 
-        return js_list
+        def crawl_recursive(file_url, depth=1):
+            if depth > 2:
+                return
+            try:
+                res = requests.get(file_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+                if res.status_code == 200:
+                    sub_matches = re.findall(rf"[\"']([a-zA-Z0-9\-_./]+\.{EXT_REGEX_STR})[\"']", res.text,
+                                             re.IGNORECASE)
+                    parsed_base = urlparse(file_url)
+                    base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+                    for sub_file in sub_matches:
+                        full_sub_url = urljoin(base_origin, sub_file)
+                        if full_sub_url not in target_files and '.css' not in full_sub_url.lower():
+                            target_files.add(full_sub_url)
+                            crawl_recursive(full_sub_url, depth + 1)
+            except Exception:
+                pass
+
+        for initial_file in list(target_files):
+            crawl_recursive(initial_file)
+
+        file_list = list(target_files)
+        print(f"\n[+] Found {len(file_list)} target files (Scripts, Configs, Logs, Backups, etc.):\n")
+        for i, f in enumerate(file_list, 1):
+            print(f"[{i}] {f}")
+
+        return file_list
 
     except Exception as e:
         print(f"[-] An error occurred: {e}")
         return []
 
 
-def save_to_file(js_list):
-    if not js_list:
-        print("[-] No JavaScript files to save.")
+def save_to_file(file_list):
+    if not file_list:
+        print("[-] No target files to save.")
         return
     filename = input("Enter filename: ").strip()
     if not filename:
         print("[-] Filename cannot be empty.")
         return
     try:
-        new_data = "\n".join(js_list)
+        new_data = "\n".join(file_list)
         if os.path.exists(filename):
             with open(filename, 'r', encoding='utf-8') as f:
                 existing_content = f.read().strip()
@@ -114,18 +181,18 @@ def save_to_file(js_list):
         print(f"[-] Error saving file: {e}")
 
 
-def analyze_single_file(js_list):
-    if not js_list:
-        print("[-] No JavaScript files available.")
+def analyze_single_file(file_list):
+    if not file_list:
+        print("[-] No target files available.")
         return
     try:
         choice = int(input("Enter the number of the file: "))
-        if 1 <= choice <= len(js_list):
-            target_js = js_list[choice - 1]
-            print(f"\n[+] Fetching: {target_js}")
-            res = requests.get(target_js, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+        if 1 <= choice <= len(file_list):
+            target_file = file_list[choice - 1]
+            print(f"\n[+] Fetching: {target_file}")
+            res = requests.get(target_file, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
             if res.status_code == 200:
-                scan_content(res.text, target_js)
+                scan_content(res.text, target_file)
             else:
                 print(f"[-] Failed to fetch file. Status code: {res.status_code}")
         else:
@@ -134,43 +201,56 @@ def analyze_single_file(js_list):
         print(f"[-] Error: {e}")
 
 
-def analyze_all_files(js_list):
-    if not js_list:
-        print("[-] No JavaScript files available.")
+def analyze_all_files(file_list):
+    if not file_list:
+        print("[-] No target files available.")
         return
-    print(f"\n[+] Starting deep scan for {len(js_list)} files...")
-    for js in js_list:
+    print(f"\n[+] Starting deep scan for {len(file_list)} files...")
+
+    def fetch_and_scan(f_url):
         try:
-            res = requests.get(js, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            res = requests.get(f_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
             if res.status_code == 200:
-                scan_content(res.text, js)
+                scan_content(res.text, f_url)
         except Exception:
-            print(f"[-] Could not fetch {js}")
+            print(f"[-] Could not fetch {f_url}")
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        executor.map(fetch_and_scan, file_list)
+
     print("[+] Batch scan completed.")
 
 
-def show_paths(target_url, js_list):
-    if not js_list:
-        print("[-] No JavaScript files available.")
+def show_paths(target_url, file_list):
+    if not file_list:
+        print("[-] No target files available.")
         return
-    print(f"\n[+] Extracting, resolving, and checking status codes from {len(js_list)} files...")
+    print(f"\n[+] Extracting, resolving, and checking status codes from {len(file_list)} files...")
     unique_full_paths = set()
     parsed_base = urlparse(target_url)
     base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
 
-    for js in js_list:
+    def extract_paths(f_url):
         try:
-            res = requests.get(js, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            res = requests.get(f_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
             if res.status_code == 200:
                 path_matches = re.finditer(PATH_PATTERN, res.text)
+                local_paths = set()
                 for match in path_matches:
                     raw_path = match.group().strip('"\'')
                     if "//" in raw_path or raw_path == "/":
                         continue
                     full_path = urljoin(base_origin, raw_path)
-                    unique_full_paths.add(full_path)
+                    local_paths.add(full_path)
+                return local_paths
         except Exception:
             pass
+        return set()
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(extract_paths, f) for f in file_list]
+        for future in as_completed(futures):
+            unique_full_paths.update(future.result())
 
     if unique_full_paths:
         print(f"\n[+] Found {len(unique_full_paths)} unique resolved paths:\n")
@@ -193,12 +273,12 @@ def show_paths(target_url, js_list):
 if __name__ == "__main__":
     print("========================================")
     print("             SecretHunter-JS            ")
-    print("      Deep Recon for JS Vulnerability   ")
+    print("    Advanced Recon for Sensitive Files  ")
     print("========================================")
     url = input("Enter target URL : ")
-    js_files = get_js_files(url)
+    target_files = get_target_files(url)
 
-    if js_files:
+    if target_files:
         while True:
             print("\n----------- Options -----------")
             print("[1] Analyze a single file")
@@ -210,13 +290,13 @@ if __name__ == "__main__":
             choice = input("Choose an option :").strip()
 
             if choice == '1':
-                analyze_single_file(js_files)
+                analyze_single_file(target_files)
             elif choice == '2':
-                analyze_all_files(js_files)
+                analyze_all_files(target_files)
             elif choice == '3':
-                show_paths(url, js_files)
+                show_paths(url, target_files)
             elif choice == '4':
-                save_to_file(js_files)
+                save_to_file(target_files)
             elif choice == '5':
                 print("[>] Good luck, Hunter.")
                 break
