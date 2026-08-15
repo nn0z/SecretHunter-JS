@@ -5,7 +5,7 @@ A Python security reconnaissance tool to discover JavaScript files, sensitive se
 ## Features
 * **JavaScript Discovery:** Extract and locate JS files from target web applications.
 * **Secret Scanner:** Scan files for exposed API keys, credentials, tokens, and sensitive strings using robust regular expressions.
-* **Endpoint Extraction:** Discover hidden API routes and URL paths embedded within scripts.
+* **Endpoint Extraction:** Discover and resolve hidden API routes, paths, and endpoints embedded within scripts, including live HTTP status code verification.
 * **Lightweight & Fast:** Built with clean, minimalist Python code for efficiency.
 
 
