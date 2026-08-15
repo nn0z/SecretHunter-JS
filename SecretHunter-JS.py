@@ -1,7 +1,8 @@
 #SecretHunter-JS
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
+import os
 import re
 
 KEYWORDS = [
@@ -40,9 +41,16 @@ def scan_content(content, js_url):
         print(f"  [FOUND KEYWORD] '{match.group()}' at: ...{content[start:end]}...")
 
     path_matches = re.finditer(PATH_PATTERN, content)
+    unique_paths = set()
     for match in path_matches:
+        raw_path = match.group().strip('"\'')
+        if "//" in raw_path or raw_path == "/":
+            continue
+        unique_paths.add(raw_path)
+
+    for path in unique_paths:
         found = True
-        print(f"  [FOUND PATH] {match.group()}")
+        print(f"  [FOUND PATH] {path}")
 
     if not found:
         print("  [+] No sensitive info or paths found.")
@@ -82,11 +90,25 @@ def save_to_file(js_list):
     if not js_list:
         print("[-] No JavaScript files to save.")
         return
-    filename = input("Enter filename: ")
+    filename = input("Enter filename: ").strip()
+    if not filename:
+        print("[-] Filename cannot be empty.")
+        return
     try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            for js in js_list:
-                f.write(js + '\n')
+        new_data = "\n".join(js_list)
+        if os.path.exists(filename):
+            with open(filename, 'r', encoding='utf-8') as f:
+                existing_content = f.read().strip()
+
+            with open(filename, 'w', encoding='utf-8') as f:
+                if existing_content:
+                    f.write(existing_content + "\n\n\n" + new_data + "\n")
+                else:
+                    f.write(new_data + "\n")
+        else:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(new_data + "\n")
+
         print(f"[+] Successfully saved to {filename}")
     except Exception as e:
         print(f"[-] Error saving file: {e}")
@@ -127,6 +149,47 @@ def analyze_all_files(js_list):
     print("[+] Batch scan completed.")
 
 
+def show_paths(target_url, js_list):
+    if not js_list:
+        print("[-] No JavaScript files available.")
+        return
+    print(f"\n[+] Extracting, resolving, and checking status codes from {len(js_list)} files...")
+    unique_full_paths = set()
+    parsed_base = urlparse(target_url)
+    base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
+
+    for js in js_list:
+        try:
+            res = requests.get(js, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            if res.status_code == 200:
+                path_matches = re.finditer(PATH_PATTERN, res.text)
+                for match in path_matches:
+                    raw_path = match.group().strip('"\'')
+                    if "//" in raw_path or raw_path == "/":
+                        continue
+                    full_path = urljoin(base_origin, raw_path)
+                    unique_full_paths.add(full_path)
+        except Exception:
+            pass
+
+    if unique_full_paths:
+        print(f"\n[+] Found {len(unique_full_paths)} unique resolved paths:\n")
+        for path in sorted(unique_full_paths):
+            try:
+                response = requests.head(path, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5, allow_redirects=True)
+                status_code = response.status_code
+            except Exception:
+                try:
+                    response = requests.get(path, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+                    status_code = response.status_code
+                except Exception:
+                    status_code = "ERR"
+
+            print(f"[{status_code}] {path}")
+    else:
+        print("  [+] No valid paths found.")
+
+
 if __name__ == "__main__":
     print("========================================")
     print("             SecretHunter-JS            ")
@@ -137,22 +200,25 @@ if __name__ == "__main__":
 
     if js_files:
         while True:
-            print("\n------ Options ------")
-            print("[1] Save to txt file")
-            print("[2] Analyze a single file")
-            print("[3] Analyze all files")
-            print("[4] Exit")
+            print("\n----------- Options -----------")
+            print("[1] Analyze a single file")
+            print("[2] Analyze all files")
+            print("[3] Endpoint extraction")
+            print("[4] Save to txt file")
+            print("[5] Exit")
 
             choice = input("Choose an option :").strip()
 
             if choice == '1':
-                save_to_file(js_files)
-            elif choice == '2':
                 analyze_single_file(js_files)
-            elif choice == '3':
+            elif choice == '2':
                 analyze_all_files(js_files)
+            elif choice == '3':
+                show_paths(url, js_files)
             elif choice == '4':
-                print("[+] Exiting program.")
+                save_to_file(js_files)
+            elif choice == '5':
+                print("[>] Good luck, Hunter.")
                 break
             else:
                 print("[-] Invalid choice.")
