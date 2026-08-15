@@ -35,7 +35,6 @@ CLOUD_PATTERNS = [
     r"storage\.googleapis\.com\/[a-zA-Z0-9\-_.]+"
 ]
 
-
 TARGET_EXTENSIONS = ('.js', '.php', '.json', '.xml', '.config', '.yml', '.yaml', '.asp', '.aspx', '.jsp', '.env',
                      '.sql', '.log', '.bak', '.properties', '.ini', '.conf')
 EXT_REGEX_STR = r"(?:js|php|json|xml|config|yml|yaml|asp|aspx|jsp|env|sql|log|bak|properties|ini|conf)"
@@ -222,50 +221,77 @@ def analyze_all_files(file_list):
 
 
 def show_paths(target_url, file_list):
-    if not file_list:
-        print("[-] No target files available.")
-        return
-    print(f"\n[+] Extracting, resolving, and checking status codes from {len(file_list)} files...")
+    print(f"\n[+] Extracting internal endpoints from index page and target files...")
     unique_full_paths = set()
     parsed_base = urlparse(target_url)
     base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
 
+    try:
+        index_res = requests.get(target_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        if index_res.status_code == 200:
+            index_matches = re.finditer(PATH_PATTERN, index_res.text)
+            for match in index_matches:
+                raw_path = match.group().strip('"\'')
+                if "//" in raw_path or raw_path == "/":
+                    continue
+                full_path = urljoin(base_origin, raw_path)
+                unique_full_paths.add(full_path)
+    except Exception:
+        pass
+
     def extract_paths(f_url):
+        local_paths = set()
         try:
             res = requests.get(f_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
             if res.status_code == 200:
                 path_matches = re.finditer(PATH_PATTERN, res.text)
-                local_paths = set()
                 for match in path_matches:
                     raw_path = match.group().strip('"\'')
                     if "//" in raw_path or raw_path == "/":
                         continue
                     full_path = urljoin(base_origin, raw_path)
                     local_paths.add(full_path)
-                return local_paths
         except Exception:
             pass
-        return set()
+        return local_paths
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(extract_paths, f) for f in file_list]
-        for future in as_completed(futures):
-            unique_full_paths.update(future.result())
+    if file_list:
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(extract_paths, f) for f in file_list]
+            for future in as_completed(futures):
+                unique_full_paths.update(future.result())
 
     if unique_full_paths:
-        print(f"\n[+] Found {len(unique_full_paths)} unique resolved paths:\n")
-        for path in sorted(unique_full_paths):
+        print(f"\n[+] Checking status codes for {len(unique_full_paths)} extracted endpoints:\n")
+
+        def check_status(path):
             try:
                 response = requests.head(path, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5, allow_redirects=True)
                 status_code = response.status_code
-            except Exception:
-                try:
-                    response = requests.get(path, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+                if status_code == 405 or status_code == 403:
+                    response = requests.get(path, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5, stream=True)
                     status_code = response.status_code
-                except Exception:
-                    status_code = "ERR"
+                return status_code, path
+            except Exception:
+                return "ERR", path
 
-            print(f"[{status_code}] {path}")
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = executor.map(check_status, sorted(unique_full_paths))
+            for status_code, path in results:
+                if status_code == 200:
+                    colored_status = f"\033[92m[{status_code}]\033[0m"
+                elif status_code == 302:
+                    colored_status = f"\033[90m[{status_code}]\033[0m"
+                elif status_code in [400, 403, 405]:
+                    colored_status = f"\033[93m[{status_code}]\033[0m"
+                elif status_code == 404:
+                    colored_status = f"\033[91m[{status_code}]\033[0m"
+                elif status_code in [500, 503]:
+                    colored_status = f"\033[94m[{status_code}]\033[0m"
+                else:
+                    colored_status = f"[{status_code}]"
+
+                print(f"{colored_status} {path}")
     else:
         print("  [+] No valid paths found.")
 
