@@ -301,7 +301,7 @@ if __name__ == "__main__":
     print("             SecretHunter-JS            ")
     print("    Advanced Recon for Sensitive Files  ")
     print("========================================")
-    url = input("Enter target URL : ")
+    url = input("Enter target URL :")
     target_files = get_target_files(url)
 
     if target_files:
