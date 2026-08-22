@@ -1,4 +1,4 @@
-#SecretHunter-JS
+# SecretHunter-JS
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -6,6 +6,9 @@ import os
 import re
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 KEYWORDS = [
     r"api_key", r"password", r"secret", r"access_token", r"auth_token", r"bearer", r"jwt",
@@ -38,6 +41,24 @@ CLOUD_PATTERNS = [
 TARGET_EXTENSIONS = ('.js', '.php', '.json', '.xml', '.config', '.yml', '.yaml', '.asp', '.aspx', '.jsp', '.env',
                      '.sql', '.log', '.bak', '.properties', '.ini', '.conf')
 EXT_REGEX_STR = r"(?:js|php|json|xml|config|yml|yaml|asp|aspx|jsp|env|sql|log|bak|properties|ini|conf)"
+
+
+def clear_screen():
+    os.system('cls' if os.name == 'nt' else 'clear')
+
+
+def print_banner():
+    banner = r"""
+    ███████╗███████╗ ██████╗██████╗ ███████╗████████╗      ██╗███████╗
+    ██╔════╝██╔════╝██╔════╝██╔══██╗██╔════╝╚══██╔══╝      ██║██╔════╝
+    ███████╗█████╗  ██║     ██████╔╝█████╗     ██║         ██║███████╗
+    ╚════██║██╔══╝  ██║     ██╔══██╗██╔══╝     ██║    ██   ██║╚════██║
+    ███████║███████╗╚██████╗██║  ██║███████╗   ██║    ╚█████╔╝███████║
+    ╚══════╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝     ╚════╝ ╚══════╝
+       [ SecretHunter-JS - Advanced Recon for Sensitive Files ]
+    """
+    print("\033[1;36m" + banner + "\033[0m")
+    print("\033[1;30m" + "=" * 95 + "\033[0m")
 
 
 def calculate_entropy(data):
@@ -93,7 +114,7 @@ def scan_content(content, file_url):
 def get_target_files(target_url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(target_url, headers=headers, timeout=10)
+        response = requests.get(target_url, headers=headers, timeout=10, verify=False)
 
         if response.status_code != 200:
             print(f"[-] Failed to connect. Status code: {response.status_code}")
@@ -123,7 +144,7 @@ def get_target_files(target_url):
             if depth > 2:
                 return
             try:
-                res = requests.get(file_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+                res = requests.get(file_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5, verify=False)
                 if res.status_code == 200:
                     sub_matches = re.findall(rf"[\"']([a-zA-Z0-9\-_./]+\.{EXT_REGEX_STR})[\"']", res.text,
                                              re.IGNORECASE)
@@ -189,7 +210,7 @@ def analyze_single_file(file_list):
         if 1 <= choice <= len(file_list):
             target_file = file_list[choice - 1]
             print(f"\n[+] Fetching: {target_file}")
-            res = requests.get(target_file, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+            res = requests.get(target_file, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10, verify=False)
             if res.status_code == 200:
                 scan_content(res.text, target_file)
             else:
@@ -208,7 +229,7 @@ def analyze_all_files(file_list):
 
     def fetch_and_scan(f_url):
         try:
-            res = requests.get(f_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            res = requests.get(f_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5, verify=False)
             if res.status_code == 200:
                 scan_content(res.text, f_url)
         except Exception:
@@ -227,7 +248,7 @@ def show_paths(target_url, file_list):
     base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
 
     try:
-        index_res = requests.get(target_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        index_res = requests.get(target_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5, verify=False)
         if index_res.status_code == 200:
             index_matches = re.finditer(PATH_PATTERN, index_res.text)
             for match in index_matches:
@@ -242,7 +263,7 @@ def show_paths(target_url, file_list):
     def extract_paths(f_url):
         local_paths = set()
         try:
-            res = requests.get(f_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+            res = requests.get(f_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5, verify=False)
             if res.status_code == 200:
                 path_matches = re.finditer(PATH_PATTERN, res.text)
                 for match in path_matches:
@@ -266,10 +287,10 @@ def show_paths(target_url, file_list):
 
         def check_status(path):
             try:
-                response = requests.head(path, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5, allow_redirects=True)
+                response = requests.head(path, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5, allow_redirects=True, verify=False)
                 status_code = response.status_code
                 if status_code == 405 or status_code == 403:
-                    response = requests.get(path, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5, stream=True)
+                    response = requests.get(path, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5, stream=True, verify=False)
                     status_code = response.status_code
                 return status_code, path
             except Exception:
@@ -297,11 +318,9 @@ def show_paths(target_url, file_list):
 
 
 if __name__ == "__main__":
-    print("========================================")
-    print("             SecretHunter-JS            ")
-    print("    Advanced Recon for Sensitive Files  ")
-    print("========================================")
-    url = input("Enter target URL :")
+    clear_screen()
+    print_banner()
+    url = input("Enter target URL : ")
     target_files = get_target_files(url)
 
     if target_files:
