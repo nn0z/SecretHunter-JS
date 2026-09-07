@@ -7,9 +7,7 @@ import re
 import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib3
-
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 KEYWORDS = [
     r"api_key", r"password", r"secret", r"access_token", r"auth_token", r"bearer", r"jwt",
     r"refresh_token", r"client_secret", r"api_secret", r"password_hash", r"passwd", r"credential",
@@ -44,19 +42,15 @@ ADVANCED_PATTERNS = {
     'postgres_uri': r'postgresql://[a-zA-Z0-9]+:[a-zA-Z0-9]+@',
     'redis_uri': r'redis://:[a-zA-Z0-9]+@',
 }
-
 PATH_PATTERN = r"[\"']\/(?:[a-zA-Z0-9\-_./]+)[\"']"
 CLOUD_PATTERNS = [
     r"[a-zA-Z0-9\-_.]+\.s3\.amazonaws\.com",
     r"[a-zA-Z0-9\-_.]+\.blob\.core\.windows\.net",
     r"storage\.googleapis\.com\/[a-zA-Z0-9\-_.]+"
 ]
-
 TARGET_EXTENSIONS = ('.js', '.php', '.json', '.xml', '.config', '.yml', '.yaml', '.asp', '.aspx', '.jsp', '.env',
                      '.sql', '.log', '.bak', '.properties', '.ini', '.conf')
 EXT_REGEX_STR = r"(?:js|php|json|xml|config|yml|yaml|asp|aspx|jsp|env|sql|log|bak|properties|ini|conf)"
-
-
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
