@@ -3,11 +3,11 @@ A Python security reconnaissance tool to discover JavaScript files, sensitive se
 
 
 ## 🚀 New Features & Updates (v2.0)
-* **Binary File Scan:** Inspect images and binary files (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.ico`) to extract hidden texts and search for sensitive keywords.
+* **Binary File Scan:** Inspect images and binary files (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`,) to extract hidden texts and search for sensitive keywords.
 * **Advanced JavaScript Deep Analysis:** Parse JS files to extract Endpoints, Functions, Variables, and High Entropy Strings/Tokens.
 * **Optimized Multi-threaded Batch Scanning:** Fast concurrent scanning using `ThreadPoolExecutor` (up to 15 workers) equipped with automatic retries for robust performance.
 * **Advanced Custom Search:** Search for custom multi-keywords across all targeted files with precise line numbers and snippet tracking.
-* **Enhanced Endpoint & Path Extraction:** Extract internal paths and verify live HTTP status codes (`200`, `302`, `403`, `404`, etc.) with colored terminal outputs.
+* **Enhanced Endpoint & Path Extraction:** Extract internal paths and verify live HTTP status codes (`200`, `302`, `403`, `404`, etc.).
 * **Persistent Results Saving:** Export and append discovered target files and findings cleanly to text files.
 
 ---
