@@ -1,4 +1,3 @@
-# SecretHunter-JS
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, unquote
@@ -33,7 +32,7 @@ except ImportError:
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 VERIFY_SSL = os.getenv("SECRETHUNTER_VERIFY_SSL", "false").lower() == "true"
-RATE_LIMIT = Semaphore(5)
+RATE_LIMIT = Semaphore(20)
 _seen_hashes = set()
 
 PATH_PATTERN = r"[\"']\/(?:[a-zA-Z0-9\-_./]+)[\"']"
@@ -1098,23 +1097,36 @@ def run_initial_analysis(target_url, target_files):
 
 def check_common_paths(base_url):
     print(f"\n[+] Checking common sensitive paths on {base_url}...")
-    for p in COMMON_PATHS:
+
+    def check_one_path(p):
         url = urljoin(base_url, p)
         if is_excluded(url):
-            continue
+            return None
         try:
             with RATE_LIMIT:
                 r = requests.head(url, headers={'User-Agent': 'Mozilla/5.0'},
-                                  timeout=5, allow_redirects=True, verify=VERIFY_SSL)
+                                  timeout=2, allow_redirects=True, verify=VERIFY_SSL)
+            if r.status_code == 405:
+                with RATE_LIMIT:
+                    r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'},
+                                     timeout=2, allow_redirects=True, verify=VERIFY_SSL)
             if r.status_code in (200, 301, 302, 401, 403):
-                print(f"  [EXPOSED] [{r.status_code}] {url}")
-                add_finding("exposed_path", url, "", f"Status {r.status_code}")
-                add_endpoint(url)
-                if r.url != url:
-                    add_endpoint(r.url)
-                    add_file(r.url)
+                return (r.status_code, url, r.url)
         except Exception:
             pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        results = executor.map(check_one_path, COMMON_PATHS)
+        for result in results:
+            if result:
+                status_code, url, final_url = result
+                print(f"  [EXPOSED] [{status_code}] {url}")
+                add_finding("exposed_path", url, "", f"Status {status_code}")
+                add_endpoint(url)
+                if final_url != url:
+                    add_endpoint(final_url)
+                    add_file(final_url)
 
 
 def get_target_files(target_url):
