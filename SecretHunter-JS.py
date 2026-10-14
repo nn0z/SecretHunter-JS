@@ -720,7 +720,6 @@ def check_firebase_exposure(content, source_url):
 
 
 def check_cors(target_url):
-    print(f"\n[+] Checking CORS on {target_url}...")
     try:
         r = requests.get(target_url,
                          headers={'Origin': 'https://evil-attacker.com'},
@@ -728,11 +727,9 @@ def check_cors(target_url):
         acao = r.headers.get('Access-Control-Allow-Origin', '')
         acac = r.headers.get('Access-Control-Allow-Credentials', '')
         if acao == '*' and acac.lower() == 'true':
-            print("  [CRITICAL] CORS: wildcard + credentials")
             add_finding("cors_critical", target_url, "",
                         "Access-Control-Allow-Origin: * with credentials=true")
         elif 'evil-attacker.com' in acao:
-            print(f"  [HIGH] CORS reflects Origin: {acao}")
             add_finding("cors_reflected", target_url, "",
                         f"Origin reflected: {acao}")
     except Exception:
@@ -768,7 +765,6 @@ def check_graphql_introspection(base_url, content=""):
                               timeout=6, verify=VERIFY_SSL,
                               headers={'Content-Type': 'application/json'})
             if r.status_code == 200 and '__schema' in r.text:
-                print(f"  [CRITICAL] GraphQL introspection ENABLED at {gql_url}")
                 add_finding("graphql_introspection_enabled", gql_url, "",
                             "GraphQL introspection is enabled - full schema exposed")
                 add_endpoint(gql_url)
@@ -1083,7 +1079,6 @@ def scan_html_file(content, file_url):
 
 
 def run_initial_analysis(target_url, target_files):
-    print(f"\n[+] Running initial analysis on {target_url}...")
     res = fetch_with_backoff(target_url, retries=2, timeout=10)
     if res and res.status_code == 200:
         soup = BeautifulSoup(res.text, 'html.parser')
@@ -1092,7 +1087,6 @@ def run_initial_analysis(target_url, target_files):
         check_graphql_introspection(target_url, res.text)
         check_security_headers(target_url, res)
     save_site_files()
-    print("[+] Initial analysis complete.")
 
 
 def check_common_paths(base_url):
@@ -1198,6 +1192,10 @@ def analyze_single_file(file_list):
     if not file_list:
         print("[-] No target files available.")
         return
+    print()
+    for i, f in enumerate(file_list, 1):
+        print(f"[{i}] {f}")
+    print()
     try:
         choice = int(input("Enter the number of the file: "))
         if 1 <= choice <= len(file_list):
@@ -1489,13 +1487,10 @@ if __name__ == "__main__":
     init_live(site_key, url)
     target_files = get_target_files(url)
     if not target_files:
-        print("\n[+] No external files found. Scanning index page directly...")
         res = fetch_with_backoff(url, retries=2, timeout=10)
         if res and res.status_code == 200:
             scan_html_file(res.text, url)
             add_file(url)
-        else:
-            print("[-] Could not fetch index page.")
 
     run_initial_analysis(url, target_files)
 
