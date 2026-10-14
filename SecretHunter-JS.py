@@ -7,6 +7,7 @@ import re
 import math
 import json
 import time
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Semaphore
 import urllib3
@@ -44,7 +45,7 @@ KEYWORDS = [
     r"oauth_token", r"oauth_secret", r"consumer_key", r"consumer_secret",
     r"encryption_key", r"cipher_key", r"auth_key", r"license_key",
     r"ftp_password", r"ftp_username", r"smtp_password", r"smtp_username",
-    r"php_mailer", r"auth_domain"
+    r"php_mailer", r"auth_domain", r"firebaseio", r"supabase", r"firebaseapp"
 ]
 
 ADVANCED_PATTERNS = {
@@ -65,6 +66,28 @@ ADVANCED_PATTERNS = {
     'twilio_sid': r'AC[a-f0-9]{32}',
     'heroku_api': r'\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b',
     'npm_token': r'npm_[a-zA-Z0-9]{36}',
+    'huggingface_token': r'hf_[a-zA-Z0-9]{34}',
+    'replicate_token': r'r8_[a-zA-Z0-9]{40}',
+    'digitalocean_token': r'dop_v1_[a-f0-9]{64}',
+    'mapbox_token': r'pk\.[a-zA-Z0-9]{60}\.[a-zA-Z0-9]{22}',
+    'contentful_token': r'CFPAT-[a-zA-Z0-9_\-]{40}',
+    'newrelic_key': r'NRAK-[A-Z0-9]{27}',
+    'sentry_dsn': r'https://[a-f0-9]{32}@[a-z0-9\.]+/\d+',
+    'square_token': r'sq0atp-[a-zA-Z0-9_\-]{22}',
+    'razorpay_key': r'rzp_(live|test)_[a-zA-Z0-9]{14}',
+    'clerk_key': r'pk_(test|live)_[a-zA-Z0-9]{40,}',
+    'firebase_db': r'https://([a-z0-9\-]+)\.firebaseio\.com',
+    'firebase_storage': r'https://firebasestorage\.googleapis\.com/v0/b/([a-z0-9\-]+)',
+    'firebase_project': r'projectId["\']?\s*[:=]\s*["\']([a-z0-9\-]+)["\']',
+    'supabase_url': r'https://([a-z0-9]+)\.supabase\.co',
+    'auth0_domain': r'[a-z0-9\-]+\.auth0\.com',
+    'okta_domain': r'[a-z0-9\-]+\.okta\.com',
+}
+
+GRAPHQL_PATTERNS = {
+    'graphql_endpoint': r'["\'](/graphql|/api/graphql|/v\d+/graphql)["\']',
+    'graphql_query': r'(query|mutation)\s+\w+\s*\([^)]*\)\s*\{',
+    'graphql_introspection': r'__schema\s*\{|__type\s*\(',
 }
 
 SEVERITY = {
@@ -97,6 +120,38 @@ SEVERITY = {
     'js_endpoint': 'info',
     'custom_search': 'low',
     'image_text': 'low',
+    'firebase_db': 'critical',
+    'firebase_storage': 'high',
+    'firebase_project': 'medium',
+    'supabase_url': 'high',
+    'auth0_domain': 'info',
+    'okta_domain': 'info',
+    'huggingface_token': 'critical',
+    'replicate_token': 'critical',
+    'digitalocean_token': 'critical',
+    'mapbox_token': 'high',
+    'contentful_token': 'high',
+    'newrelic_key': 'high',
+    'sentry_dsn': 'medium',
+    'square_token': 'critical',
+    'razorpay_key': 'critical',
+    'clerk_key': 'high',
+    'firebase_open_db': 'critical',
+    'supabase_open': 'critical',
+    'graphql_endpoint': 'high',
+    'graphql_query': 'medium',
+    'graphql_introspection': 'medium',
+    'graphql_introspection_enabled': 'critical',
+    'jwt_alg_none': 'critical',
+    'jwt_hmac': 'medium',
+    'jwt_sensitive_data': 'high',
+    'cors_critical': 'critical',
+    'cors_reflected': 'high',
+    'validated_secret': 'critical',
+    'high_risk_endpoint': 'high',
+    'vulnerable_lib': 'medium',
+    'config_exposed': 'high',
+    'firebase_rules_open': 'critical',
 }
 
 IGNORE_VALUES = {
@@ -316,7 +371,11 @@ def init_live(site_key, target_url):
 def add_finding(finding_type, value, file_url="", context=""):
     if LIVE["status"] != "running":
         return
-    if finding_type not in ('endpoint_status', 'path', 'js_endpoint', 'exposed_path'):
+    if finding_type not in ('endpoint_status', 'path', 'js_endpoint', 'exposed_path',
+                            'graphql_endpoint', 'graphql_query', 'cors_critical',
+                            'cors_reflected', 'firebase_db', 'supabase_url',
+                            'auth0_domain', 'okta_domain', 'firebase_project',
+                            'jwt_hmac', 'high_risk_endpoint', 'vulnerable_lib'):
         if is_false_positive(value) and is_false_positive(context):
             return
     severity = get_severity(finding_type)
@@ -582,6 +641,43 @@ def export_json():
     print(f"[+] JSON exported: {json_file}")
 
 
+def export_txt():
+    if LIVE["site_key"] is None:
+        print("[-] No active scan.")
+        return
+    site_key = LIVE["site_key"]
+    site_dir = RESULTS_DIR / site_key
+    site_dir.mkdir(parents=True, exist_ok=True)
+    txt_file = site_dir / f"{site_key}_run{LIVE['scan_number']}.txt"
+    lines = []
+    lines.append(f"SecretHunter-JS Report")
+    lines.append(f"Site Key: {site_key}")
+    lines.append(f"Run: {LIVE['scan_number']}")
+    lines.append(f"Target: {LIVE['target_url']}")
+    lines.append(f"Started: {LIVE['started_at']}")
+    lines.append(f"Finished: {LIVE['finished_at']}")
+    lines.append(f"Status: {LIVE['status']}")
+    lines.append("")
+    lines.append(f"=== FILES ({len(LIVE['files'])}) ===")
+    for f in LIVE["files"]:
+        lines.append(f)
+    lines.append("")
+    lines.append(f"=== FINDINGS ({len(LIVE['findings'])}) ===")
+    for f in sorted(LIVE["findings"], key=lambda x: ["critical", "high", "medium", "low", "info"].index(x.get("severity", "low"))):
+        lines.append(f"[{f['severity'].upper()}] [{f['type']}] {f['value']}")
+        if f.get("file"):
+            lines.append(f"    File: {f['file']}")
+        if f.get("context"):
+            lines.append(f"    Context: {f['context']}")
+    lines.append("")
+    lines.append(f"=== ENDPOINTS ({len(LIVE['endpoints'])}) ===")
+    for e in LIVE["endpoints"]:
+        lines.append(e)
+    with open(txt_file, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"[+] TXT exported: {txt_file}")
+
+
 def finalize_live():
     if LIVE["status"] != "running":
         return
@@ -653,6 +749,225 @@ def find_source_maps(content, file_url):
             pass
 
 
+def try_source_map_variants(js_url):
+    candidates = []
+    if js_url.endswith(".js"):
+        candidates.append(js_url[:-3] + ".js.map")
+        candidates.append(js_url + ".map")
+    else:
+        candidates.append(js_url + ".map")
+    for sm_url in candidates:
+        if is_excluded(sm_url):
+            continue
+        r = fetch_with_backoff(sm_url, retries=1, timeout=8)
+        if r and r.status_code == 200 and r.text.strip().startswith("{"):
+            try:
+                data = r.json()
+                sources = data.get("sources", [])
+                contents = data.get("sourcesContent", [])
+                print(f"  [SOURCE MAP VARIANT] {sm_url} ({len(sources)} sources)")
+                add_finding("source_map", sm_url, js_url, "Source map exposed via variant")
+                for i, src in enumerate(sources[:10]):
+                    if i < len(contents) and contents[i]:
+                        scan_content(contents[i], f"{sm_url}#{src}")
+                    add_finding("source_map_source", src, sm_url)
+                return True
+            except Exception:
+                pass
+    return False
+
+
+def analyze_jwt_token(token, source_url=""):
+    try:
+        parts = token.split('.')
+        if len(parts) != 3:
+            return
+        header_b64 = parts[0] + '=' * (-len(parts[0]) % 4)
+        payload_b64 = parts[1] + '=' * (-len(parts[1]) % 4)
+        header_data = json.loads(base64.urlsafe_b64decode(header_b64).decode('utf-8', errors='ignore'))
+        payload_data = json.loads(base64.urlsafe_b64decode(payload_b64).decode('utf-8', errors='ignore'))
+
+        alg = str(header_data.get('alg', '')).lower()
+        if alg == 'none':
+            print(f"  [JWT ALG=NONE] {token[:40]}...")
+            add_finding("jwt_alg_none", token[:80], source_url,
+                        "JWT with alg=none - CRITICAL")
+        elif alg.startswith('hs'):
+            add_finding("jwt_hmac", token[:80], source_url,
+                        f"JWT uses {header_data.get('alg')} (HMAC)")
+
+        sensitive_keys = ['password', 'ssn', 'credit_card', 'api_key', 'secret',
+                          'private', 'token', 'pwd', 'pin']
+        for key in payload_data:
+            if any(s in str(key).lower() for s in sensitive_keys):
+                add_finding("jwt_sensitive_data",
+                            f"{key}={str(payload_data[key])[:60]}",
+                            source_url,
+                            f"Sensitive claim in JWT: {key}")
+    except Exception:
+        pass
+
+
+def check_firebase_exposure(content, source_url):
+    for m in re.finditer(ADVANCED_PATTERNS['firebase_db'], content, re.IGNORECASE):
+        db_url = m.group(0)
+        if is_false_positive(db_url):
+            continue
+        print(f"  [FIREBASE DB] {db_url}")
+        add_finding("firebase_db", db_url, source_url, "Firebase database URL detected")
+        try:
+            test_url = db_url.rstrip("/") + "/.json"
+            r = requests.get(test_url, timeout=5, verify=VERIFY_SSL)
+            if r.status_code == 200 and r.text.strip() not in ("null", ""):
+                print(f"    [CRITICAL] Firebase DB is publicly readable!")
+                add_finding("firebase_open_db", test_url, source_url,
+                            "Firebase Realtime DB allows public read!")
+        except Exception:
+            pass
+
+    for m in re.finditer(ADVANCED_PATTERNS['firebase_storage'], content, re.IGNORECASE):
+        add_finding("firebase_storage", m.group(0), source_url,
+                    "Firebase Storage bucket reference")
+
+    for m in re.finditer(ADVANCED_PATTERNS['firebase_project'], content, re.IGNORECASE):
+        add_finding("firebase_project", m.group(1), source_url,
+                    "Firebase project ID exposed")
+
+    supabase_urls = set()
+    for m in re.finditer(ADVANCED_PATTERNS['supabase_url'], content, re.IGNORECASE):
+        su = m.group(0)
+        if su in supabase_urls:
+            continue
+        supabase_urls.add(su)
+        add_finding("supabase_url", su, source_url, "Supabase project URL detected")
+
+
+def check_cors(target_url):
+    print(f"\n[+] Checking CORS on {target_url}...")
+    try:
+        r = requests.get(target_url,
+                         headers={'Origin': 'https://evil-attacker.com'},
+                         timeout=8, verify=VERIFY_SSL)
+        acao = r.headers.get('Access-Control-Allow-Origin', '')
+        acac = r.headers.get('Access-Control-Allow-Credentials', '')
+        if acao == '*' and acac.lower() == 'true':
+            print("  [CRITICAL] CORS: wildcard + credentials")
+            add_finding("cors_critical", target_url, "",
+                        "Access-Control-Allow-Origin: * with credentials=true")
+        elif 'evil-attacker.com' in acao:
+            print(f"  [HIGH] CORS reflects Origin: {acao}")
+            add_finding("cors_reflected", target_url, "",
+                        f"Origin reflected: {acao}")
+    except Exception:
+        pass
+
+
+def check_graphql_introspection(base_url, content=""):
+    candidates = set()
+    for m in re.finditer(GRAPHQL_PATTERNS['graphql_endpoint'], content):
+        candidates.add(urljoin(base_url, m.group(1)))
+    for p in ["/graphql", "/api/graphql", "/v1/graphql", "/graphiql"]:
+        candidates.add(urljoin(base_url, p))
+
+    for gql_url in candidates:
+        if is_excluded(gql_url):
+            continue
+        try:
+            r = requests.post(gql_url,
+                              json={"query": "{__schema{types{name}}}"},
+                              timeout=6, verify=VERIFY_SSL,
+                              headers={'Content-Type': 'application/json'})
+            if r.status_code == 200 and '__schema' in r.text:
+                print(f"  [CRITICAL] GraphQL introspection ENABLED at {gql_url}")
+                add_finding("graphql_introspection_enabled", gql_url, "",
+                            "GraphQL introspection is enabled - full schema exposed")
+                add_endpoint(gql_url)
+            elif r.status_code in (200, 400, 401, 403):
+                add_finding("graphql_endpoint", gql_url, "",
+                            f"GraphQL endpoint detected (status {r.status_code})")
+                add_endpoint(gql_url)
+        except Exception:
+            pass
+
+
+VULNERABLE_LIBS = {
+    'jquery': (r'jQuery\s+v?["\']?([\d.]+)', {'3.5.0': 'CVE-2020-11022/11023'}),
+    'lodash': (r'lodash[^\d]{0,20}v?([\d.]+)', {'4.17.21': 'CVE-2021-23337'}),
+    'angular': (r'angular[^\d]{0,20}v?([\d.]+)', {'1.8.0': 'Multiple XSS'}),
+    'bootstrap': (r'bootstrap[^\d]{0,20}v?([\d.]+)', {'3.4.1': 'CVE-2019-8331'}),
+}
+
+
+def detect_vulnerable_libs(content, file_url):
+    for lib, (pattern, vulns) in VULNERABLE_LIBS.items():
+        for m in re.finditer(pattern, content, re.IGNORECASE):
+            version = m.group(1)
+            try:
+                ver_parts = tuple(int(x) for x in version.split('.')[:3])
+            except Exception:
+                continue
+            for vuln_ver, cve in vulns.items():
+                try:
+                    vuln_parts = tuple(int(x) for x in vuln_ver.split('.')[:3])
+                except Exception:
+                    continue
+                if ver_parts < vuln_parts:
+                    add_finding("vulnerable_lib", f"{lib} {version}",
+                                file_url, f"Vulnerable version - {cve}")
+                    break
+
+
+HIGH_RISK_KEYWORDS = ['/admin', '/debug', '/internal', '/actuator',
+                      '/console', '/.env', '/config', '/backup', '/phpinfo']
+
+
+def classify_endpoint_risk(ep):
+    ep_lower = ep.lower()
+    for hr in HIGH_RISK_KEYWORDS:
+        if hr in ep_lower:
+            return True
+    return False
+
+
+def validate_secret(finding_type, value):
+    try:
+        if finding_type == 'github_token':
+            r = requests.get('https://api.github.com/user',
+                             headers={'Authorization': f'token {value}'},
+                             timeout=5, verify=VERIFY_SSL)
+            return r.status_code == 200
+        if finding_type == 'slack_token':
+            r = requests.post('https://slack.com/api/auth.test',
+                              headers={'Authorization': f'Bearer {value}'},
+                              timeout=5, verify=VERIFY_SSL)
+            return r.status_code == 200 and r.json().get('ok', False)
+        if finding_type == 'openai_key':
+            r = requests.get('https://api.openai.com/v1/models',
+                             headers={'Authorization': f'Bearer {value}'},
+                             timeout=5, verify=VERIFY_SSL)
+            return r.status_code == 200
+        if finding_type == 'stripe_live':
+            r = requests.get('https://api.stripe.com/v1/charges',
+                             headers={'Authorization': f'Bearer {value}'},
+                             timeout=5, verify=VERIFY_SSL)
+            return r.status_code in (200, 403) and 'api_key' not in r.text.lower()
+    except Exception:
+        return False
+    return None
+
+
+def extract_bundler_chunks(content, file_url):
+    chunks = set()
+    chunks.update(re.findall(r'\.p\s*\+\s*["\']([^"\']+\.js)["\']', content))
+    chunks.update(re.findall(r'__webpack_require__\.p\s*\+\s*["\']([^"\']+\.js)["\']', content))
+    chunks.update(re.findall(r'["\']/assets/([a-zA-Z0-9_\-]+\.js)["\']', content))
+    chunks.update(re.findall(r'["\']\./([a-zA-Z0-9_\-/]+\.js)["\']', content))
+    for c in chunks:
+        full = urljoin(file_url, c)
+        add_endpoint(full)
+    return chunks
+
+
 def analyze_javascript(file_url):
     try:
         res = fetch_with_backoff(file_url, retries=2, timeout=10)
@@ -681,6 +996,9 @@ def analyze_javascript(file_url):
             for ep in unique_endpoints:
                 add_endpoint(ep)
                 add_finding("js_endpoint", ep, file_url)
+                if classify_endpoint_risk(ep):
+                    add_finding("high_risk_endpoint", ep, file_url,
+                                "High-risk endpoint detected in JS")
         if functions:
             print(f"  Sample functions: {functions[:5]}")
         if long_strings:
@@ -689,6 +1007,15 @@ def analyze_javascript(file_url):
                     print(f"  [HIGH ENTROPY STRING] {s[:50]}...")
                     add_finding("high_entropy_js", s[:120], file_url,
                                 f"Entropy: {calculate_entropy(s):.2f}")
+
+        extract_bundler_chunks(pretty, file_url)
+        try_source_map_variants(file_url)
+        detect_vulnerable_libs(pretty, file_url)
+        check_firebase_exposure(pretty, file_url)
+
+        for m in re.finditer(ADVANCED_PATTERNS['jwt_token'], pretty):
+            analyze_jwt_token(m.group(), file_url)
+
         return {
             'endpoints': unique_endpoints,
             'functions': functions,
@@ -723,6 +1050,14 @@ def scan_content(content, file_url):
             print(f"  [FOUND {pattern_name.upper()}] {val}")
             add_finding(pattern_name, val, file_url)
 
+            if pattern_name in ('github_token', 'slack_token', 'openai_key', 'stripe_live'):
+                if validate_secret(pattern_name, val):
+                    add_finding("validated_secret", val, file_url,
+                                f"LIVE {pattern_name} - validated against API")
+
+            if pattern_name == 'jwt_token':
+                analyze_jwt_token(val, file_url)
+
     for pattern in CLOUD_PATTERNS:
         for match in re.finditer(pattern, content):
             val = match.group()
@@ -731,6 +1066,19 @@ def scan_content(content, file_url):
             found = True
             print(f"  [FOUND CLOUD STORAGE] {val}")
             add_finding("cloud_storage", val, file_url)
+
+    for gql_name, gql_pat in GRAPHQL_PATTERNS.items():
+        for match in re.finditer(gql_pat, content):
+            if gql_name == 'graphql_endpoint':
+                add_finding("graphql_endpoint", match.group(1), file_url)
+                add_endpoint(match.group(1))
+            elif gql_name == 'graphql_query':
+                add_finding("graphql_query", match.group()[:80], file_url)
+            elif gql_name == 'graphql_introspection':
+                add_finding("graphql_introspection", match.group(), file_url,
+                            "Introspection query in code")
+
+    check_firebase_exposure(content, file_url)
 
     words = re.findall(r'[\"\']([a-zA-Z0-9\-_/+=]{16,})[\"\']', content)
     for word in words:
@@ -755,6 +1103,9 @@ def scan_content(content, file_url):
         print(f"  [FOUND PATH] {path}")
         add_finding("path", path, file_url)
         add_endpoint(path)
+        if classify_endpoint_risk(path):
+            add_finding("high_risk_endpoint", path, file_url,
+                        "High-risk path detected")
 
     if not found:
         print("  [+] No sensitive info or paths found.")
@@ -806,16 +1157,16 @@ def scan_html_file(content, file_url):
                 add_finding(pattern_name, match.group(), file_url, "HTML comment")
 
 
-def analyze_inline_scripts(target_url):
-    print(f"\n[+] Fetching {target_url} for inline script analysis...")
+def run_initial_analysis(target_url, target_files):
+    print(f"\n[+] Running initial analysis on {target_url}...")
     res = fetch_with_backoff(target_url, retries=2, timeout=10)
-    if not res or res.status_code != 200:
-        print("[-] Failed to fetch target page.")
-        return
-    soup = BeautifulSoup(res.text, 'html.parser')
-    scan_inline_scripts(soup, target_url)
+    if res and res.status_code == 200:
+        soup = BeautifulSoup(res.text, 'html.parser')
+        scan_inline_scripts(soup, target_url)
+        check_cors(target_url)
+        check_graphql_introspection(target_url, res.text)
     save_site_files()
-    print("[+] Inline scripts scan complete.")
+    print("[+] Initial analysis complete.")
 
 
 def check_common_paths(base_url):
@@ -899,32 +1250,6 @@ def get_target_files(target_url):
     except Exception as e:
         print(f"[-] An error occurred: {e}")
         return []
-
-
-def save_to_file(file_list):
-    if not file_list:
-        print("[-] No target files to save.")
-        return
-    filename = input("Enter filename: ").strip()
-    if not filename:
-        print("[-] Filename cannot be empty.")
-        return
-    try:
-        new_data = "\n".join(file_list)
-        if os.path.exists(filename):
-            with open(filename, 'r', encoding='utf-8') as f:
-                existing_content = f.read().strip()
-            with open(filename, 'w', encoding='utf-8') as f:
-                if existing_content:
-                    f.write(existing_content + "\n\n\n" + new_data + "\n")
-                else:
-                    f.write(new_data + "\n")
-        else:
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(new_data + "\n")
-        print(f"[+] Successfully saved to {filename}")
-    except Exception as e:
-        print(f"[-] Error saving file: {e}")
 
 
 def analyze_single_file(file_list):
@@ -1034,6 +1359,27 @@ def analyze_all_files_optimized(file_list):
                     findings.append(f"{pattern_name}: {val}")
                     add_finding(pattern_name, val, f_url)
 
+                    if pattern_name in ('github_token', 'slack_token', 'openai_key', 'stripe_live'):
+                        if validate_secret(pattern_name, val):
+                            add_finding("validated_secret", val, f_url,
+                                        f"LIVE {pattern_name} - validated")
+
+                    if pattern_name == 'jwt_token':
+                        analyze_jwt_token(val, f_url)
+
+            for gql_name, gql_pat in GRAPHQL_PATTERNS.items():
+                for match in re.finditer(gql_pat, res.text):
+                    if gql_name == 'graphql_endpoint':
+                        add_finding("graphql_endpoint", match.group(1), f_url)
+                        add_endpoint(match.group(1))
+                    elif gql_name == 'graphql_query':
+                        add_finding("graphql_query", match.group()[:80], f_url)
+                    elif gql_name == 'graphql_introspection':
+                        add_finding("graphql_introspection", match.group(), f_url)
+
+            check_firebase_exposure(res.text, f_url)
+            detect_vulnerable_libs(res.text, f_url)
+
             lower = f_url.lower()
             ctype = res.headers.get('Content-Type', '').lower()
             if lower.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico')):
@@ -1045,6 +1391,8 @@ def analyze_all_files_optimized(file_list):
                 js_results = analyze_javascript(f_url)
                 if js_results:
                     findings.append(f"JS analysis: {len(js_results['functions'])} functions")
+                    extract_bundler_chunks(res.text, f_url)
+                    try_source_map_variants(f_url)
             return f_url, findings
         return f_url, []
 
@@ -1131,6 +1479,9 @@ def show_paths(target_url, file_list):
                 print(f"{colored_status} {path}")
                 add_endpoint(path)
                 add_finding("endpoint_status", f"{status_code} - {path}", "")
+                if classify_endpoint_risk(path) and status_code == 200:
+                    add_finding("high_risk_endpoint", path, "",
+                                f"High-risk endpoint accessible ({status_code})")
     else:
         print("  [+] No valid paths found.")
     save_site_files()
@@ -1152,6 +1503,26 @@ def open_results_in_browser():
     webbrowser.open(url)
 
 
+def results_menu():
+    while True:
+        print("\n----------- Results -----------")
+        print("[1] Open in Browser")
+        print("[2] Export JSON")
+        print("[3] Export TXT")
+        print("[4] Back")
+        sub = input("Choose an option :").strip()
+        if sub == '1':
+            open_results_in_browser()
+        elif sub == '2':
+            export_json()
+        elif sub == '3':
+            export_txt()
+        elif sub == '4':
+            break
+        else:
+            print("[-] Invalid choice.")
+
+
 if __name__ == "__main__":
     clear_screen()
     print_banner()
@@ -1171,19 +1542,19 @@ if __name__ == "__main__":
             add_file(url)
         else:
             print("[-] Could not fetch index page.")
+
+    run_initial_analysis(url, target_files)
+
     save_site_files()
 
     while True:
         print("\n----------- Options -----------")
         print("[1] Analyze a single file")
-        print("[2] Analyze all files (Optimized)")
+        print("[2] Analyze all files")
         print("[3] Advanced custom search")
         print("[4] Endpoint extraction")
-        print("[5] Analyze inline scripts (HTML + data-attrs + comments)")
-        print("[6] Open Current Scan Results in Browser")
-        print("[7] Export JSON")
-        print("[8] Save to txt file")
-        print("[9] Exit")
+        print("[5] Results")
+        print("[6] Exit")
         choice = input("Choose an option :").strip()
 
         if choice == '1':
@@ -1204,17 +1575,8 @@ if __name__ == "__main__":
         elif choice == '4':
             show_paths(url, target_files)
         elif choice == '5':
-            analyze_inline_scripts(url)
+            results_menu()
         elif choice == '6':
-            open_results_in_browser()
-        elif choice == '7':
-            export_json()
-        elif choice == '8':
-            if not target_files:
-                print("[-] No target files available.")
-            else:
-                save_to_file(target_files)
-        elif choice == '9':
             finalize_live()
             print("[>] Good luck, Hunter.")
             break
