@@ -17,6 +17,13 @@ import datetime
 import webbrowser
 from pathlib import Path
 
+from wordlists import (
+    KEYWORDS, ADVANCED_PATTERNS, GRAPHQL_PATTERNS, SEVERITY,
+    IGNORE_VALUES, COMMON_ENGLISH_WORDS, COMMON_PATHS,
+    CLOUD_PATTERNS, TARGET_EXTENSIONS, EXT_REGEX_STR,
+    COMMON_SUBDOMAINS, VULNERABLE_LIBS, HIGH_RISK_KEYWORDS,
+)
+
 try:
     import jsbeautifier
     HAS_JSBEAUTIFIER = True
@@ -29,219 +36,9 @@ VERIFY_SSL = os.getenv("SECRETHUNTER_VERIFY_SSL", "false").lower() == "true"
 RATE_LIMIT = Semaphore(5)
 _seen_hashes = set()
 
-KEYWORDS = [
-    r"api_key", r"password", r"secret", r"access_token", r"auth_token", r"bearer", r"jwt",
-    r"refresh_token", r"client_secret", r"api_secret", r"password_hash", r"passwd", r"credential",
-    r"aws_access_key", r"aws_secret_key", r"aws_account_id", r"azure_storage_key",
-    r"firebase_config", r"gcp_api_key", r"s3_bucket", r"do_token", r"digitalocean_token",
-    r"docker_hub", r"kubernetes", r"k8s", r"root_password", r"ssh_private_key",
-    r"db_password", r"db_username", r"db_url", r"connection_string", r"mysql_uri",
-    r"mongodb_uri", r"mysql_password", r"postgres_url", r"redis_url", r"sql_connection",
-    r"/admin", r"/config", r"/env", r"/backup", r"/debug", r"/phpinfo", r"/.git",
-    r"internal_api", r"dev_mode", r"staging_url", r"/wp-config", r"/cpanel",
-    r"stripe_key", r"stripe_secret", r"paypal_client_id", r"braintree_key",
-    r"google_maps_api", r"maps_api_key", r"sendgrid_key", r"mailgun_key",
-    r"private_key", r"ssh_key", r"public_key",
-    r"credit_card", r"token_type", r"session_id",
-    r"slack_token", r"slack_webhook", r"discord_webhook", r"telegram_bot_token",
-    r"oauth_token", r"oauth_secret", r"consumer_key", r"consumer_secret",
-    r"encryption_key", r"cipher_key", r"auth_key", r"license_key",
-    r"ftp_password", r"ftp_username", r"smtp_password", r"smtp_username",
-    r"php_mailer", r"auth_domain", r"firebaseio", r"supabase", r"firebaseapp"
-]
-
-ADVANCED_PATTERNS = {
-    'github_token': r'ghp_[a-zA-Z0-9]{36}',
-    'github_old': r'\b[a-f0-9]{40}\b',
-    'aws_key': r'AKIA[0-9A-Z]{16}',
-    'aws_secret': r'(?i)aws[_-]?secret[_-]?(?:access[_-]?)?key["\']?\s*[:=]\s*["\']([A-Za-z0-9/+=]{40})["\']',
-    'google_api': r'AIza[0-9A-Za-z-_]{35}',
-    'google_oauth': r'[0-9]+-[a-z0-9_]{32}\.apps\.googleusercontent\.com',
-    'slack_token': r'xox[baprs]-[0-9a-zA-Z-]{10,}',
-    'jwt_token': r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+',
-    'private_key': r'-----BEGIN (RSA|DSA|EC|OPENSSH) PRIVATE KEY-----',
-    'private_ssh': r'-----BEGIN OPENSSH PRIVATE KEY-----',
-    'mongodb_uri': r'mongodb(?:\+srv)?://[a-zA-Z0-9_]+:[^@\s]+@',
-    'mysql_uri': r'mysql://[a-zA-Z0-9_]+:[^@\s]+@',
-    'postgres_uri': r'postgresql://[a-zA-Z0-9_]+:[^@\s]+@',
-    'redis_uri': r'redis://:[^@\s]+@',
-    'openai_key': r'sk-[a-zA-Z0-9]{48}',
-    'anthropic_key': r'sk-ant-[a-zA-Z0-9\-_]{95}',
-    'stripe_live': r'sk_live_[0-9a-zA-Z]{24}',
-    'twilio_sid': r'AC[a-f0-9]{32}',
-    'heroku_api': r'\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b',
-    'npm_token': r'npm_[a-zA-Z0-9]{36}',
-    'huggingface_token': r'hf_[a-zA-Z0-9]{34}',
-    'replicate_token': r'r8_[a-zA-Z0-9]{40}',
-    'digitalocean_token': r'dop_v1_[a-f0-9]{64}',
-    'mapbox_token': r'pk\.[a-zA-Z0-9]{60}\.[a-zA-Z0-9]{22}',
-    'contentful_token': r'CFPAT-[a-zA-Z0-9_\-]{40}',
-    'newrelic_key': r'NRAK-[A-Z0-9]{27}',
-    'sentry_dsn': r'https://[a-f0-9]{32}@[a-z0-9\.]+/\d+',
-    'square_token': r'sq0atp-[a-zA-Z0-9_\-]{22}',
-    'razorpay_key': r'rzp_(live|test)_[a-zA-Z0-9]{14}',
-    'clerk_key': r'pk_(test|live)_[a-zA-Z0-9]{40,}',
-    'firebase_db': r'https://([a-z0-9\-]+)\.firebaseio\.com',
-    'firebase_storage': r'https://firebasestorage\.googleapis\.com/v0/b/([a-z0-9\-]+)',
-    'firebase_project': r'projectId["\']?\s*[:=]\s*["\']([a-z0-9\-]+)["\']',
-    'supabase_url': r'https://([a-z0-9]+)\.supabase\.co',
-    'auth0_domain': r'[a-z0-9\-]+\.auth0\.com',
-    'okta_domain': r'[a-z0-9\-]+\.okta\.com',
-    'facebook_token': r'EAACEdEose0cBA[0-9A-Za-z]+',
-    'generic_api_key': r'(?i)(?:api[_-]?key|apikey|access[_-]?key)["\']?\s*[:=]\s*["\']([a-zA-Z0-9\-_]{20,64})["\']',
-    'generic_secret': r'(?i)(?:secret|passwd|password)["\']?\s*[:=]\s*["\']([^"\']{12,80})["\']',
-    'postmessage_origin': r'postMessage\([^,]+,\s*["\']\*["\']\)',
-    'localstorage_secret': r'localStorage\.(?:setItem|getItem)\(["\'][^"\']*(?:token|key|secret|auth)[^"\']*["\']',
-    'sessionstorage_secret': r'sessionStorage\.(?:setItem|getItem)\(["\'][^"\']*(?:token|key|secret)[^"\']*["\']',
-    'document_cookie': r'document\.cookie\s*=\s*["\'][^"\']{0,200}',
-}
-
-GRAPHQL_PATTERNS = {
-    'graphql_endpoint': r'["\'](/graphql|/api/graphql|/v\d+/graphql)["\']',
-    'graphql_query': r'(query|mutation)\s+\w+\s*\([^)]*\)\s*\{',
-    'graphql_introspection': r'__schema\s*\{|__type\s*\(',
-}
-
-SEVERITY = {
-    'private_key': 'critical',
-    'private_ssh': 'critical',
-    'aws_key': 'critical',
-    'aws_secret': 'critical',
-    'github_token': 'critical',
-    'mongodb_uri': 'critical',
-    'mysql_uri': 'critical',
-    'postgres_uri': 'critical',
-    'redis_uri': 'critical',
-    'openai_key': 'critical',
-    'anthropic_key': 'critical',
-    'stripe_live': 'critical',
-    'twilio_sid': 'high',
-    'heroku_api': 'high',
-    'npm_token': 'high',
-    'google_api': 'high',
-    'slack_token': 'high',
-    'jwt_token': 'high',
-    'github_old': 'medium',
-    'source_map': 'medium',
-    'source_map_source': 'medium',
-    'high_entropy': 'medium',
-    'high_entropy_js': 'medium',
-    'cloud_storage': 'medium',
-    'exposed_path': 'high',
-    'endpoint_status': 'info',
-    'path': 'info',
-    'keyword': 'low',
-    'js_endpoint': 'info',
-    'custom_search': 'low',
-    'image_text': 'low',
-    'firebase_db': 'critical',
-    'firebase_storage': 'high',
-    'firebase_project': 'medium',
-    'supabase_url': 'high',
-    'auth0_domain': 'info',
-    'okta_domain': 'info',
-    'huggingface_token': 'critical',
-    'replicate_token': 'critical',
-    'digitalocean_token': 'critical',
-    'mapbox_token': 'high',
-    'contentful_token': 'high',
-    'newrelic_key': 'high',
-    'sentry_dsn': 'medium',
-    'square_token': 'critical',
-    'razorpay_key': 'critical',
-    'clerk_key': 'high',
-    'firebase_open_db': 'critical',
-    'supabase_open': 'critical',
-    'graphql_endpoint': 'high',
-    'graphql_query': 'medium',
-    'graphql_introspection': 'medium',
-    'graphql_introspection_enabled': 'critical',
-    'jwt_alg_none': 'critical',
-    'jwt_hmac': 'medium',
-    'jwt_sensitive_data': 'high',
-    'cors_critical': 'critical',
-    'cors_reflected': 'high',
-    'validated_secret': 'critical',
-    'high_risk_endpoint': 'high',
-    'vulnerable_lib': 'medium',
-    'config_exposed': 'high',
-    'firebase_rules_open': 'critical',
-    'facebook_token': 'critical',
-    'google_oauth': 'medium',
-    'generic_api_key': 'high',
-    'generic_secret': 'critical',
-    'postmessage_origin': 'medium',
-    'localstorage_secret': 'high',
-    'sessionstorage_secret': 'high',
-    'document_cookie': 'medium',
-}
-
-IGNORE_VALUES = {
-    "undefined", "null", "true", "false", "example", "test", "demo",
-    "your_key_here", "xxx", "changeme", "placeholder", "todo", "sample",
-    "password", "secret", "apikey", "api_key", "token", "your_api_key",
-    "your_token_here", "insert_key_here", "enter_key_here", "n/a", "na",
-    "none", "empty", "default", "dummy", "fake", "mock", "foobar",
-    "lorem", "ipsum", "1234", "abcd", "aaaa", "0000", "username", "user_name",
-    "userName", "user_id", "userId", "email", "salt", "SALT"
-}
-
-COMMON_ENGLISH_WORDS = {
-    "about", "contact", "login", "home", "index", "main", "page", "user",
-    "account", "profile", "settings", "dashboard", "search", "help", "support",
-    "welcome", "hello", "world", "error", "success", "failure", "loading",
-    "submit", "cancel", "confirm", "delete", "update", "create", "read"
-}
-
-COMMON_PATHS = [
-    "/robots.txt", "/sitemap.xml", "/.well-known/security.txt",
-    "/.git/config", "/.git/HEAD", "/.env", "/.DS_Store",
-    "/backup.zip", "/backup.tar.gz", "/db.sql", "/dump.sql",
-    "/server-status", "/phpinfo.php", "/info.php", "/test.php",
-    "/config.php", "/wp-config.php", "/.htaccess", "/web.config",
-    "/package.json", "/composer.json", "/.svn/entries",
-    "/.well-known/openid-configuration", "/crossdomain.xml",
-    "/clientaccesspolicy.xml", "/api/swagger.json", "/swagger.json",
-    "/openapi.json", "/api-docs", "/graphql", "/graphiql"
-]
-
 PATH_PATTERN = r"[\"']\/(?:[a-zA-Z0-9\-_./]+)[\"']"
-CLOUD_PATTERNS = [
-    r"[a-zA-Z0-9\-_.]+\.s3\.amazonaws\.com",
-    r"[a-zA-Z0-9\-_.]+\.blob\.core\.windows\.net",
-    r"storage\.googleapis\.com\/[a-zA-Z0-9\-_.]+"
-]
-
-TARGET_EXTENSIONS = ('.js', '.php', '.json', '.xml', '.config', '.yml', '.yaml', '.asp', '.aspx', '.jsp', '.env',
-                     '.sql', '.log', '.bak', '.properties', '.ini', '.conf', '.map', '.html', '.htm')
-
-EXT_REGEX_STR = r"(?:js|php|json|xml|config|yml|yaml|asp|aspx|jsp|env|sql|log|bak|properties|ini|conf|map|html|htm)"
 
 RESULTS_DIR = Path("results")
-
-COMMON_SUBDOMAINS = {
-    "www", "main", "api", "app", "admin", "dev", "staging", "test", "testing",
-    "portal", "dashboard", "my", "web", "mobile", "m", "beta", "demo", "support",
-    "help", "blog", "shop", "store", "secure", "login", "auth", "cdn", "static",
-    "assets", "media", "files", "download", "downloads", "upload", "uploads",
-    "mail", "smtp", "ftp", "vpn", "proxy", "gateway", "edge", "node", "server",
-    "cloud", "host", "hosting", "ns", "ns1", "ns2", "dns", "mx", "pop", "imap",
-    "sandbox", "preview", "prod", "production", "qa", "uat", "stage", "local",
-    "internal", "intranet", "extranet", "partner", "partners", "client", "clients",
-    "customer", "customers", "user", "users", "member", "members", "account",
-    "accounts", "payment", "payments", "billing", "invoice", "orders", "order",
-    "cart", "checkout", "docs", "doc", "wiki", "forum", "community", "news",
-    "events", "jobs", "careers", "about", "contact", "info", "go", "link", "links",
-    "url", "redirect", "track", "tracking", "analytics", "stats", "status", "monitor",
-    "graphql", "rest", "ws", "socket", "realtime", "live", "stream", "video", "audio",
-    "img", "images", "image", "css", "js", "fonts", "font", "lib", "libs", "pkg",
-    "packages", "npm", "git", "gitlab", "github", "bitbucket", "jenkins", "ci", "cd",
-    "build", "deploy", "k8s", "kubernetes", "docker", "registry", "repo", "repos",
-    "backup", "backups", "db", "database", "sql", "mysql", "postgres", "mongo",
-    "redis", "cache", "queue", "worker", "workers", "task", "tasks", "cron", "job",
-    "jobs", "logs", "log", "metrics", "grafana", "kibana", "prometheus", "sentry",
-    "new", "old", "v1", "v2", "v3", "ver1", "ver2", "legacy", "archive", "archived"
-}
 
 LIVE = {
     "site_key": None,
@@ -984,14 +781,6 @@ def check_graphql_introspection(base_url, content=""):
             pass
 
 
-VULNERABLE_LIBS = {
-    'jquery': (r'jQuery\s+v?["\']?([\d.]+)', {'3.5.0': 'CVE-2020-11022/11023'}),
-    'lodash': (r'lodash[^\d]{0,20}v?([\d.]+)', {'4.17.21': 'CVE-2021-23337'}),
-    'angular': (r'angular[^\d]{0,20}v?([\d.]+)', {'1.8.0': 'Multiple XSS'}),
-    'bootstrap': (r'bootstrap[^\d]{0,20}v?([\d.]+)', {'3.4.1': 'CVE-2019-8331'}),
-}
-
-
 def detect_vulnerable_libs(content, file_url):
     for lib, (pattern, vulns) in VULNERABLE_LIBS.items():
         for m in re.finditer(pattern, content, re.IGNORECASE):
@@ -1009,10 +798,6 @@ def detect_vulnerable_libs(content, file_url):
                     add_finding("vulnerable_lib", f"{lib} {version}",
                                 file_url, f"Vulnerable version - {cve}")
                     break
-
-
-HIGH_RISK_KEYWORDS = ['/admin', '/debug', '/internal', '/actuator',
-                      '/console', '/.env', '/config', '/backup', '/phpinfo']
 
 
 def classify_endpoint_risk(ep):
