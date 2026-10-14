@@ -1,13 +1,14 @@
 # SecretHunter-JS
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, unquote
 import os
 import re
 import math
 import json
 import time
 import base64
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Semaphore
 import urllib3
@@ -26,6 +27,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 VERIFY_SSL = os.getenv("SECRETHUNTER_VERIFY_SSL", "false").lower() == "true"
 RATE_LIMIT = Semaphore(5)
+_seen_hashes = set()
 
 KEYWORDS = [
     r"api_key", r"password", r"secret", r"access_token", r"auth_token", r"bearer", r"jwt",
@@ -52,10 +54,13 @@ ADVANCED_PATTERNS = {
     'github_token': r'ghp_[a-zA-Z0-9]{36}',
     'github_old': r'\b[a-f0-9]{40}\b',
     'aws_key': r'AKIA[0-9A-Z]{16}',
+    'aws_secret': r'(?i)aws[_-]?secret[_-]?(?:access[_-]?)?key["\']?\s*[:=]\s*["\']([A-Za-z0-9/+=]{40})["\']',
     'google_api': r'AIza[0-9A-Za-z-_]{35}',
+    'google_oauth': r'[0-9]+-[a-z0-9_]{32}\.apps\.googleusercontent\.com',
     'slack_token': r'xox[baprs]-[0-9a-zA-Z-]{10,}',
     'jwt_token': r'eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+',
     'private_key': r'-----BEGIN (RSA|DSA|EC|OPENSSH) PRIVATE KEY-----',
+    'private_ssh': r'-----BEGIN OPENSSH PRIVATE KEY-----',
     'mongodb_uri': r'mongodb(?:\+srv)?://[a-zA-Z0-9_]+:[^@\s]+@',
     'mysql_uri': r'mysql://[a-zA-Z0-9_]+:[^@\s]+@',
     'postgres_uri': r'postgresql://[a-zA-Z0-9_]+:[^@\s]+@',
@@ -82,6 +87,13 @@ ADVANCED_PATTERNS = {
     'supabase_url': r'https://([a-z0-9]+)\.supabase\.co',
     'auth0_domain': r'[a-z0-9\-]+\.auth0\.com',
     'okta_domain': r'[a-z0-9\-]+\.okta\.com',
+    'facebook_token': r'EAACEdEose0cBA[0-9A-Za-z]+',
+    'generic_api_key': r'(?i)(?:api[_-]?key|apikey|access[_-]?key)["\']?\s*[:=]\s*["\']([a-zA-Z0-9\-_]{20,64})["\']',
+    'generic_secret': r'(?i)(?:secret|passwd|password)["\']?\s*[:=]\s*["\']([^"\']{12,80})["\']',
+    'postmessage_origin': r'postMessage\([^,]+,\s*["\']\*["\']\)',
+    'localstorage_secret': r'localStorage\.(?:setItem|getItem)\(["\'][^"\']*(?:token|key|secret|auth)[^"\']*["\']',
+    'sessionstorage_secret': r'sessionStorage\.(?:setItem|getItem)\(["\'][^"\']*(?:token|key|secret)[^"\']*["\']',
+    'document_cookie': r'document\.cookie\s*=\s*["\'][^"\']{0,200}',
 }
 
 GRAPHQL_PATTERNS = {
@@ -92,7 +104,9 @@ GRAPHQL_PATTERNS = {
 
 SEVERITY = {
     'private_key': 'critical',
+    'private_ssh': 'critical',
     'aws_key': 'critical',
+    'aws_secret': 'critical',
     'github_token': 'critical',
     'mongodb_uri': 'critical',
     'mysql_uri': 'critical',
@@ -152,6 +166,14 @@ SEVERITY = {
     'vulnerable_lib': 'medium',
     'config_exposed': 'high',
     'firebase_rules_open': 'critical',
+    'facebook_token': 'critical',
+    'google_oauth': 'medium',
+    'generic_api_key': 'high',
+    'generic_secret': 'critical',
+    'postmessage_origin': 'medium',
+    'localstorage_secret': 'high',
+    'sessionstorage_secret': 'high',
+    'document_cookie': 'medium',
 }
 
 IGNORE_VALUES = {
@@ -162,6 +184,13 @@ IGNORE_VALUES = {
     "none", "empty", "default", "dummy", "fake", "mock", "foobar",
     "lorem", "ipsum", "1234", "abcd", "aaaa", "0000", "username", "user_name",
     "userName", "user_id", "userId", "email", "salt", "SALT"
+}
+
+COMMON_ENGLISH_WORDS = {
+    "about", "contact", "login", "home", "index", "main", "page", "user",
+    "account", "profile", "settings", "dashboard", "search", "help", "support",
+    "welcome", "hello", "world", "error", "success", "failure", "loading",
+    "submit", "cancel", "confirm", "delete", "update", "create", "read"
 }
 
 COMMON_PATHS = [
@@ -294,6 +323,12 @@ def is_false_positive(value):
         return True
     if re.match(r'^[a-zA-Z]+$', v) and len(v) < 15:
         return True
+    if re.match(r'^[a-zA-Z_]+$', v) and len(v) < 20 and vl in COMMON_ENGLISH_WORDS:
+        return True
+    if vl.endswith(('.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.woff', '.woff2', '.ttf', '.ico')):
+        return True
+    if re.match(r'^\d{4}-\d{2}-\d{2}', v):
+        return True
     return False
 
 
@@ -327,7 +362,36 @@ def is_excluded(url):
     return False
 
 
-def fetch_with_backoff(url, retries=3, timeout=10, stream=False):
+def content_hash(text):
+    return hashlib.md5(text.encode('utf-8', 'ignore')).hexdigest()
+
+
+def decode_obfuscated(content):
+    decoded_chunks = []
+    for m in re.finditer(r'atob\(["\']([A-Za-z0-9+/=]{16,})["\']\)', content):
+        try:
+            decoded_chunks.append(base64.b64decode(m.group(1)).decode('utf-8', 'ignore'))
+        except Exception:
+            pass
+    for m in re.finditer(r'(?:\\x[0-9a-fA-F]{2}){4,}', content):
+        try:
+            decoded_chunks.append(bytes.fromhex(m.group().replace('\\x', '')).decode('utf-8', 'ignore'))
+        except Exception:
+            pass
+    for m in re.finditer(r'(?:\\u[0-9a-fA-F]{4}){4,}', content):
+        try:
+            decoded_chunks.append(m.group().encode().decode('unicode_escape'))
+        except Exception:
+            pass
+    for m in re.finditer(r'(?:%[0-9a-fA-F]{2}){4,}', content):
+        try:
+            decoded_chunks.append(unquote(m.group()))
+        except Exception:
+            pass
+    return "\n".join(decoded_chunks)
+
+
+def fetch_with_backoff(url, retries=3, timeout=10, stream=False, max_size=5 * 1024 * 1024):
     for i in range(retries):
         if is_excluded(url):
             return None
@@ -335,6 +399,12 @@ def fetch_with_backoff(url, retries=3, timeout=10, stream=False):
             with RATE_LIMIT:
                 r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'},
                                  timeout=timeout, verify=VERIFY_SSL, stream=stream)
+            if stream and r.headers.get('Content-Length'):
+                try:
+                    if int(r.headers['Content-Length']) > max_size:
+                        return None
+                except Exception:
+                    pass
             if r.status_code == 429:
                 time.sleep(2 ** i)
                 continue
@@ -375,7 +445,9 @@ def add_finding(finding_type, value, file_url="", context=""):
                             'graphql_endpoint', 'graphql_query', 'cors_critical',
                             'cors_reflected', 'firebase_db', 'supabase_url',
                             'auth0_domain', 'okta_domain', 'firebase_project',
-                            'jwt_hmac', 'high_risk_endpoint', 'vulnerable_lib'):
+                            'jwt_hmac', 'high_risk_endpoint', 'vulnerable_lib',
+                            'postmessage_origin', 'localstorage_secret',
+                            'sessionstorage_secret', 'document_cookie'):
         if is_false_positive(value) and is_false_positive(context):
             return
     severity = get_severity(finding_type)
@@ -715,14 +787,16 @@ def scan_binary_content(content, file_url):
 
 
 def beautify_js(content):
-    if not HAS_JSBEAUTIFIER:
-        return content
-    try:
-        opts = jsbeautifier.default_options()
-        opts.indent_size = 2
-        return jsbeautifier.beautify(content, opts)
-    except Exception:
-        return content
+    if HAS_JSBEAUTIFIER:
+        try:
+            opts = jsbeautifier.default_options()
+            opts.indent_size = 2
+            return jsbeautifier.beautify(content, opts)
+        except Exception:
+            pass
+    if len(content) > 5000 and content.count('\n') < 50:
+        content = re.sub(r'([;{}])', r'\1\n', content)
+    return content
 
 
 def find_source_maps(content, file_url):
@@ -745,6 +819,13 @@ def find_source_maps(content, file_url):
                         add_finding("source_map_source", src, sm_url)
                 except Exception:
                     pass
+            elif r and r.status_code == 404:
+                for sg in ['/src/', '/app/', '/js/', '/source/', '/sources/']:
+                    test_url = urljoin(file_url, sg)
+                    rr = fetch_with_backoff(test_url, retries=1, timeout=5)
+                    if rr and rr.status_code == 200:
+                        print(f"    [+] Source dir guess accessible: {test_url}")
+                        add_endpoint(test_url)
         except Exception:
             pass
 
@@ -862,6 +943,19 @@ def check_cors(target_url):
         pass
 
 
+def check_security_headers(target_url, response):
+    if not response:
+        return
+    csp = response.headers.get('Content-Security-Policy', '')
+    if 'unsafe-inline' in csp or 'unsafe-eval' in csp:
+        add_finding("cors_critical", target_url, "", "Weak CSP: unsafe-inline/eval present")
+    if 'Strict-Transport-Security' not in response.headers and target_url.startswith('https'):
+        add_finding("vulnerable_lib", "HSTS missing", target_url, "Missing HSTS header")
+    xfo = response.headers.get('X-Frame-Options', '')
+    if not xfo:
+        add_finding("vulnerable_lib", "X-Frame-Options missing", target_url, "Clickjacking risk")
+
+
 def check_graphql_introspection(base_url, content=""):
     candidates = set()
     for m in re.finditer(GRAPHQL_PATTERNS['graphql_endpoint'], content):
@@ -951,6 +1045,34 @@ def validate_secret(finding_type, value):
                              headers={'Authorization': f'Bearer {value}'},
                              timeout=5, verify=VERIFY_SSL)
             return r.status_code in (200, 403) and 'api_key' not in r.text.lower()
+        if finding_type == 'google_api':
+            r = requests.get(f'https://maps.googleapis.com/maps/api/geocode/json?address=test&key={value}',
+                             timeout=5, verify=VERIFY_SSL)
+            return r.status_code == 200 and 'error_message' not in r.text.lower()
+        if finding_type == 'npm_token':
+            r = requests.get('https://registry.npmjs.org/-/whoami',
+                             headers={'Authorization': f'Bearer {value}'},
+                             timeout=5, verify=VERIFY_SSL)
+            return r.status_code == 200
+        if finding_type == 'digitalocean_token':
+            r = requests.get('https://api.digitalocean.com/v2/account',
+                             headers={'Authorization': f'Bearer {value}'},
+                             timeout=5, verify=VERIFY_SSL)
+            return r.status_code == 200
+        if finding_type == 'huggingface_token':
+            r = requests.get('https://huggingface.co/api/whoami-v2',
+                             headers={'Authorization': f'Bearer {value}'},
+                             timeout=5, verify=VERIFY_SSL)
+            return r.status_code == 200
+        if finding_type == 'mapbox_token':
+            r = requests.get(f'https://api.mapbox.com/tokens/v2?access_token={value}',
+                             timeout=5, verify=VERIFY_SSL)
+            return r.status_code == 200
+        if finding_type == 'replicate_token':
+            r = requests.get('https://api.replicate.com/v1/account',
+                             headers={'Authorization': f'Token {value}'},
+                             timeout=5, verify=VERIFY_SSL)
+            return r.status_code == 200
     except Exception:
         return False
     return None
@@ -1008,7 +1130,15 @@ def analyze_javascript(file_url):
                     add_finding("high_entropy_js", s[:120], file_url,
                                 f"Entropy: {calculate_entropy(s):.2f}")
 
-        extract_bundler_chunks(pretty, file_url)
+        chunks = extract_bundler_chunks(pretty, file_url)
+        for c in chunks:
+            full = urljoin(file_url, c)
+            if is_excluded(full):
+                continue
+            r = fetch_with_backoff(full, retries=1, timeout=8)
+            if r and r.status_code == 200:
+                scan_content(r.text, full)
+
         try_source_map_variants(file_url)
         detect_vulnerable_libs(pretty, file_url)
         check_firebase_exposure(pretty, file_url)
@@ -1028,6 +1158,15 @@ def analyze_javascript(file_url):
 
 
 def scan_content(content, file_url):
+    h = content_hash(content)
+    if h in _seen_hashes:
+        return
+    _seen_hashes.add(h)
+
+    decoded = decode_obfuscated(content)
+    if decoded:
+        content = content + "\n" + decoded
+
     print(f"\n[!] Scanning: {file_url}")
     found = False
     keyword_pattern = re.compile('|'.join(KEYWORDS), re.IGNORECASE)
@@ -1050,7 +1189,9 @@ def scan_content(content, file_url):
             print(f"  [FOUND {pattern_name.upper()}] {val}")
             add_finding(pattern_name, val, file_url)
 
-            if pattern_name in ('github_token', 'slack_token', 'openai_key', 'stripe_live'):
+            if pattern_name in ('github_token', 'slack_token', 'openai_key', 'stripe_live',
+                                'google_api', 'npm_token', 'digitalocean_token',
+                                'huggingface_token', 'mapbox_token', 'replicate_token'):
                 if validate_secret(pattern_name, val):
                     add_finding("validated_secret", val, file_url,
                                 f"LIVE {pattern_name} - validated against API")
@@ -1165,6 +1306,7 @@ def run_initial_analysis(target_url, target_files):
         scan_inline_scripts(soup, target_url)
         check_cors(target_url)
         check_graphql_introspection(target_url, res.text)
+        check_security_headers(target_url, res)
     save_site_files()
     print("[+] Initial analysis complete.")
 
@@ -1178,11 +1320,14 @@ def check_common_paths(base_url):
         try:
             with RATE_LIMIT:
                 r = requests.head(url, headers={'User-Agent': 'Mozilla/5.0'},
-                                  timeout=5, allow_redirects=False, verify=VERIFY_SSL)
+                                  timeout=5, allow_redirects=True, verify=VERIFY_SSL)
             if r.status_code in (200, 301, 302, 401, 403):
                 print(f"  [EXPOSED] [{r.status_code}] {url}")
                 add_finding("exposed_path", url, "", f"Status {r.status_code}")
                 add_endpoint(url)
+                if r.url != url:
+                    add_endpoint(r.url)
+                    add_file(r.url)
         except Exception:
             pass
 
@@ -1339,11 +1484,14 @@ def analyze_all_files_optimized(file_list):
         if res and res.status_code == 200:
             findings = []
             print(f"\n[!] Scanning: {f_url}")
+            decoded = decode_obfuscated(res.text)
+            text = res.text + ("\n" + decoded if decoded else "")
+
             keyword_pattern = re.compile('|'.join(KEYWORDS), re.IGNORECASE)
-            for match in re.finditer(keyword_pattern, res.text):
+            for match in re.finditer(keyword_pattern, text):
                 start = max(0, match.start() - 60)
-                end = min(len(res.text), match.end() + 60)
-                snippet = f"...{res.text[start:end]}..."
+                end = min(len(text), match.end() + 60)
+                snippet = f"...{text[start:end]}..."
                 if is_false_positive(snippet):
                     continue
                 print(f"  [FOUND KEYWORD] '{match.group()}' at: {snippet}")
@@ -1351,7 +1499,7 @@ def analyze_all_files_optimized(file_list):
                 add_finding("keyword", match.group(), f_url, snippet)
 
             for pattern_name, pattern in ADVANCED_PATTERNS.items():
-                for match in re.finditer(pattern, res.text, re.IGNORECASE | re.MULTILINE):
+                for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
                     val = match.group()
                     if is_false_positive(val):
                         continue
@@ -1359,7 +1507,9 @@ def analyze_all_files_optimized(file_list):
                     findings.append(f"{pattern_name}: {val}")
                     add_finding(pattern_name, val, f_url)
 
-                    if pattern_name in ('github_token', 'slack_token', 'openai_key', 'stripe_live'):
+                    if pattern_name in ('github_token', 'slack_token', 'openai_key', 'stripe_live',
+                                        'google_api', 'npm_token', 'digitalocean_token',
+                                        'huggingface_token', 'mapbox_token', 'replicate_token'):
                         if validate_secret(pattern_name, val):
                             add_finding("validated_secret", val, f_url,
                                         f"LIVE {pattern_name} - validated")
@@ -1368,7 +1518,7 @@ def analyze_all_files_optimized(file_list):
                         analyze_jwt_token(val, f_url)
 
             for gql_name, gql_pat in GRAPHQL_PATTERNS.items():
-                for match in re.finditer(gql_pat, res.text):
+                for match in re.finditer(gql_pat, text):
                     if gql_name == 'graphql_endpoint':
                         add_finding("graphql_endpoint", match.group(1), f_url)
                         add_endpoint(match.group(1))
@@ -1377,8 +1527,8 @@ def analyze_all_files_optimized(file_list):
                     elif gql_name == 'graphql_introspection':
                         add_finding("graphql_introspection", match.group(), f_url)
 
-            check_firebase_exposure(res.text, f_url)
-            detect_vulnerable_libs(res.text, f_url)
+            check_firebase_exposure(text, f_url)
+            detect_vulnerable_libs(text, f_url)
 
             lower = f_url.lower()
             ctype = res.headers.get('Content-Type', '').lower()
@@ -1391,7 +1541,14 @@ def analyze_all_files_optimized(file_list):
                 js_results = analyze_javascript(f_url)
                 if js_results:
                     findings.append(f"JS analysis: {len(js_results['functions'])} functions")
-                    extract_bundler_chunks(res.text, f_url)
+                    chunks = extract_bundler_chunks(res.text, f_url)
+                    for c in chunks:
+                        full = urljoin(f_url, c)
+                        if is_excluded(full):
+                            continue
+                        rr = fetch_with_backoff(full, retries=1, timeout=8)
+                        if rr and rr.status_code == 200:
+                            scan_content(rr.text, full)
                     try_source_map_variants(f_url)
             return f_url, findings
         return f_url, []
