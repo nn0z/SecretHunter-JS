@@ -8,13 +8,21 @@ import json
 import time
 import base64
 import hashlib
+import ipaddress
+import socket
+import threading
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Semaphore
+from threading import Semaphore, Lock
+from collections import Counter, deque
 import urllib3
 import html as html_lib
 import datetime
 import webbrowser
 from pathlib import Path
+from functools import lru_cache
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from wordlists import (
     KEYWORDS, ADVANCED_PATTERNS, GRAPHQL_PATTERNS, SEVERITY,
@@ -29,15 +37,67 @@ try:
 except ImportError:
     HAS_JSBEAUTIFIER = False
 
+try:
+    import lxml  # noqa
+    HTML_PARSER = 'lxml'
+except ImportError:
+    HTML_PARSER = 'html.parser'
+
+try:
+    import diskcache
+    HAS_DISKCACHE = True
+except ImportError:
+    HAS_DISKCACHE = False
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 VERIFY_SSL = os.getenv("SECRETHUNTER_VERIFY_SSL", "false").lower() == "true"
+VALIDATE_SECRETS = os.getenv("SECRETHUNTER_VALIDATE_SECRETS", "false").lower() == "true"
+
 RATE_LIMIT = Semaphore(20)
 _seen_hashes = set()
+_seen_lock = Lock()
+_graphql_checked_domains = set()
+_graphql_lock = Lock()
 
 PATH_PATTERN = r"[\"']\/(?:[a-zA-Z0-9\-_./]+)[\"']"
+KEYWORD_PATTERN = re.compile('|'.join(KEYWORDS), re.IGNORECASE) if KEYWORDS else None
+PATH_RE = re.compile(PATH_PATTERN)
 
 RESULTS_DIR = Path("results")
+CACHE_DIR = Path(".secrethunter_cache")
+MAX_DECODE_CHUNKS = 50
+MAX_DECODE_TOTAL = 500_000
+MAX_HEAVY_SCAN_SIZE = 2 * 1024 * 1024
+MAX_BEAUTIFY_SIZE = 2 * 1024 * 1024
+
+BLOCKED_HOSTS = {'localhost', 'metadata.google.internal', 'metadata', 'instance-data'}
+BLOCKED_NETS = [
+    ipaddress.ip_network('127.0.0.0/8'),
+    ipaddress.ip_network('10.0.0.0/8'),
+    ipaddress.ip_network('172.16.0.0/12'),
+    ipaddress.ip_network('192.168.0.0/16'),
+    ipaddress.ip_network('169.254.0.0/16'),
+    ipaddress.ip_network('0.0.0.0/8'),
+    ipaddress.ip_network('::1/128'),
+    ipaddress.ip_network('fc00::/7'),
+    ipaddress.ip_network('fe80::/10'),
+]
+
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+]
+
+KNOWN_FP = {
+    'true', 'false', 'null', 'undefined', 'function', 'return',
+    'string', 'number', 'object', 'boolean', 'array', 'symbol',
+    'application/json', 'text/html', 'text/plain', 'utf-8',
+    'getelementbyid', 'addeventlistener', 'queryselector',
+    'console.log', 'console.error', 'console.warn',
+}
 
 LIVE = {
     "site_key": None,
@@ -52,6 +112,47 @@ LIVE = {
 }
 
 
+class TokenBucket:
+    def __init__(self, rate=5.0, capacity=10):
+        self.rate = rate
+        self.capacity = capacity
+        self.tokens = float(capacity)
+        self.last = time.monotonic()
+        self.lock = Lock()
+
+    def consume(self, n=1):
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+                self.last = now
+                if self.tokens >= n:
+                    self.tokens -= n
+                    return
+                wait = (n - self.tokens) / self.rate
+            time.sleep(wait)
+
+
+BUCKET = TokenBucket(rate=5.0, capacity=10)
+
+
+def make_session():
+    s = requests.Session()
+    retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    s.mount('http://', adapter)
+    s.mount('https://', adapter)
+    return s
+
+
+SESSION = make_session()
+
+if HAS_DISKCACHE:
+    CACHE = diskcache.Cache(str(CACHE_DIR), size_limit=500 * 1024 * 1024)
+else:
+    CACHE = None
+
+
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
@@ -62,7 +163,7 @@ def print_banner():
     ██╔════╝██╔════╝██╔════╝██╔══██╗██╔════╝╚══██╔══╝      ██║██╔════╝
     ███████╗█████╗  ██║     ██████╔╝█████╗     ██║         ██║███████╗
     ╚════██║██╔══╝  ██║     ██╔══██╗██╔══╝     ██║    ██   ██║╚════██║
-    ███████║███████╗╚██████╗██║  ██║███████╗   ██║    ╚█████╔╝███████║
+    ███████║███████╗╚██████╗██║  ██║███████╗   ██║    ╚█████╔╝███████╗
     ╚══════╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝     ╚════╝ ╚══════╝
        [ SecretHunter-JS - Advanced Recon for Sensitive Files ]
     """
@@ -79,9 +180,14 @@ def extract_site_key(url):
         parts = parts[1:]
     site_key = parts[0] if parts else "unknown"
     site_key = re.sub(r'[^a-zA-Z0-9_\-]', '_', site_key)
-    return site_key or "unknown"
+    site_key = site_key.strip('._-')[:64] or "unknown"
+    reserved = {'CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'LPT1', 'LPT2'}
+    if site_key.upper() in reserved:
+        site_key = f"_{site_key}"
+    return site_key
 
 
+@lru_cache(maxsize=50000)
 def esc(s):
     return html_lib.escape(str(s))
 
@@ -102,28 +208,25 @@ def is_false_positive(value):
     if not value:
         return True
     v = str(value).strip()
-    if len(v) < 8:
-        return True
     vl = v.lower()
-    if vl in IGNORE_VALUES:
+    if len(v) < 6:
+        return True
+    if vl in IGNORE_VALUES or vl in KNOWN_FP:
         return True
     if re.match(r'^[\$\{\}<%]', v):
         return True
-    if re.match(r'^(?:your|my|the|some|any|example|test|demo|sample|placeholder|dummy|fake|mock)[_\-]', vl):
+    if re.fullmatch(r'[xX\*\.\-_\s]+', v):
         return True
-    if re.match(r'^[xX]+$', v):
-        return True
-    if len(set(v)) <= 2:
-        return True
-    if re.match(r'^[A-Z_]{2,20}$', v):
-        return True
-    if re.match(r'^[a-zA-Z]+$', v) and len(v) < 15:
-        return True
-    if re.match(r'^[a-zA-Z_]+$', v) and len(v) < 20 and vl in COMMON_ENGLISH_WORDS:
-        return True
-    if vl.endswith(('.css', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.woff', '.woff2', '.ttf', '.ico')):
+    if re.fullmatch(r'(.)\1{5,}', v):
         return True
     if re.match(r'^\d{4}-\d{2}-\d{2}', v):
+        return True
+    if vl.endswith(('.css', '.png', '.jpg', '.jpeg', '.gif', '.svg',
+                    '.woff', '.woff2', '.ttf', '.ico', '.webp', '.mp4', '.webm')):
+        return True
+    if re.match(r'^(?:your|my|the|some|any|example|test|demo|sample|placeholder|dummy|fake|mock)[_\-]', vl):
+        return True
+    if re.match(r'^[a-zA-Z_]+$', v) and vl in COMMON_ENGLISH_WORDS:
         return True
     return False
 
@@ -158,52 +261,127 @@ def is_excluded(url):
     return False
 
 
+def is_safe_url(url):
+    try:
+        p = urlparse(url)
+        if p.scheme not in ('http', 'https'):
+            return False
+        host = p.hostname
+        if not host or host.lower() in BLOCKED_HOSTS:
+            return False
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            try:
+                ip = ipaddress.ip_address(socket.gethostbyname(host))
+            except Exception:
+                return True
+        return not any(ip in net for net in BLOCKED_NETS)
+    except Exception:
+        return False
+
+
 def content_hash(text):
     return hashlib.md5(text.encode('utf-8', 'ignore')).hexdigest()
 
 
 def decode_obfuscated(content):
     decoded_chunks = []
+    total = 0
+
     for m in re.finditer(r'atob\(["\']([A-Za-z0-9+/=]{16,})["\']\)', content):
+        if len(decoded_chunks) >= MAX_DECODE_CHUNKS or total >= MAX_DECODE_TOTAL:
+            break
         try:
-            decoded_chunks.append(base64.b64decode(m.group(1)).decode('utf-8', 'ignore'))
+            d = base64.b64decode(m.group(1)).decode('utf-8', 'ignore')
+            decoded_chunks.append(d)
+            total += len(d)
         except Exception:
             pass
+
     for m in re.finditer(r'(?:\\x[0-9a-fA-F]{2}){4,}', content):
+        if len(decoded_chunks) >= MAX_DECODE_CHUNKS or total >= MAX_DECODE_TOTAL:
+            break
         try:
-            decoded_chunks.append(bytes.fromhex(m.group().replace('\\x', '')).decode('utf-8', 'ignore'))
+            d = bytes.fromhex(m.group().replace('\\x', '')).decode('utf-8', 'ignore')
+            decoded_chunks.append(d)
+            total += len(d)
         except Exception:
             pass
+
     for m in re.finditer(r'(?:\\u[0-9a-fA-F]{4}){4,}', content):
+        if len(decoded_chunks) >= MAX_DECODE_CHUNKS or total >= MAX_DECODE_TOTAL:
+            break
         try:
-            decoded_chunks.append(m.group().encode().decode('unicode_escape'))
+            d = m.group().encode().decode('unicode_escape')
+            decoded_chunks.append(d)
+            total += len(d)
         except Exception:
             pass
+
     for m in re.finditer(r'(?:%[0-9a-fA-F]{2}){4,}', content):
+        if len(decoded_chunks) >= MAX_DECODE_CHUNKS or total >= MAX_DECODE_TOTAL:
+            break
         try:
-            decoded_chunks.append(unquote(m.group()))
+            d = unquote(m.group())
+            decoded_chunks.append(d)
+            total += len(d)
         except Exception:
             pass
+
     return "\n".join(decoded_chunks)
 
 
 def fetch_with_backoff(url, retries=3, timeout=10, stream=False, max_size=5 * 1024 * 1024):
+    if is_excluded(url):
+        return None
+    if not is_safe_url(url):
+        return None
+
+    cache_key = None
+    if CACHE is not None and not stream:
+        cache_key = hashlib.sha256(url.encode()).hexdigest()
+        cached = CACHE.get(cache_key)
+        if cached:
+            try:
+                text, status, headers = cached
+                r = requests.models.Response()
+                r.status_code = status
+                r._content = text.encode('utf-8', 'ignore')
+                r.headers.update(headers)
+                r.url = url
+                return r
+            except Exception:
+                pass
+
     for i in range(retries):
-        if is_excluded(url):
-            return None
+        BUCKET.consume()
         try:
             with RATE_LIMIT:
-                r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'},
-                                 timeout=timeout, verify=VERIFY_SSL, stream=stream)
+                r = SESSION.get(
+                    url,
+                    headers={'User-Agent': random.choice(USER_AGENTS)},
+                    timeout=timeout,
+                    verify=VERIFY_SSL,
+                    stream=stream,
+                )
             if stream and r.headers.get('Content-Length'):
                 try:
                     if int(r.headers['Content-Length']) > max_size:
+                        r.close()
                         return None
                 except Exception:
                     pass
             if r.status_code == 429:
-                time.sleep(2 ** i)
+                retry_after = r.headers.get('Retry-After')
+                wait = int(retry_after) if (retry_after and retry_after.isdigit()) else (2 ** i)
+                time.sleep(wait)
                 continue
+            if cache_key and r.status_code == 200 and not stream:
+                try:
+                    CACHE.set(cache_key, (r.text, r.status_code, dict(r.headers)), expire=3600)
+                except Exception:
+                    pass
             return r
         except Exception:
             if i == retries - 1:
@@ -222,28 +400,31 @@ def init_live(site_key, target_url):
     LIVE["findings"] = []
     LIVE["endpoints"] = []
     site_dir = RESULTS_DIR / site_key
-    site_file = site_dir / f"{site_key}.html"
-    if site_file.exists():
+    site_dir.mkdir(parents=True, exist_ok=True)
+    max_num = 0
+    for rf in site_dir.glob("run_*.json"):
         try:
-            content = site_file.read_text(encoding="utf-8")
-            nums = re.findall(r'id="run-(\d+)"', content)
-            LIVE["scan_number"] = (max(int(n) for n in nums) + 1) if nums else 1
+            n = int(rf.stem.split("_")[1])
+            if n > max_num:
+                max_num = n
         except Exception:
-            LIVE["scan_number"] = 1
-    else:
-        LIVE["scan_number"] = 1
+            pass
+    LIVE["scan_number"] = max_num + 1
 
 
 def add_finding(finding_type, value, file_url="", context=""):
     if LIVE["status"] != "running":
         return
-    if finding_type not in ('endpoint_status', 'path', 'js_endpoint', 'exposed_path',
-                            'graphql_endpoint', 'graphql_query', 'cors_critical',
-                            'cors_reflected', 'firebase_db', 'supabase_url',
-                            'auth0_domain', 'okta_domain', 'firebase_project',
-                            'jwt_hmac', 'high_risk_endpoint', 'vulnerable_lib',
-                            'postmessage_origin', 'localstorage_secret',
-                            'sessionstorage_secret', 'document_cookie'):
+    raw_types = (
+        'endpoint_status', 'path', 'js_endpoint', 'exposed_path',
+        'graphql_endpoint', 'graphql_query', 'cors_critical',
+        'cors_reflected', 'firebase_db', 'supabase_url',
+        'auth0_domain', 'okta_domain', 'firebase_project',
+        'jwt_hmac', 'high_risk_endpoint', 'vulnerable_lib',
+        'postmessage_origin', 'localstorage_secret',
+        'sessionstorage_secret', 'document_cookie',
+    )
+    if finding_type not in raw_types:
         if is_false_positive(value) and is_false_positive(context):
             return
     severity = get_severity(finding_type)
@@ -382,7 +563,8 @@ def render_run_section(scan, site_key, include_anchor=True):
     parts.append('<div class="section">')
     parts.append(f'<h3>⚠️ Findings (<span class="count">{len(findings)}</span>)</h3>')
     if findings:
-        sorted_findings = sorted(findings, key=lambda x: ["critical", "high", "medium", "low", "info"].index(x.get("severity", "low")))
+        sev_order = ["critical", "high", "medium", "low", "info"]
+        sorted_findings = sorted(findings, key=lambda x: sev_order.index(x.get("severity", "low")))
         for f in sorted_findings:
             sev = f.get("severity", "low")
             parts.append('<div class="finding">')
@@ -411,51 +593,46 @@ def render_run_section(scan, site_key, include_anchor=True):
     return "\n".join(parts)
 
 
-def extract_old_run_blocks(site_file, current_num):
-    if not site_file.exists():
-        return []
-    try:
-        content = site_file.read_text(encoding="utf-8")
-    except Exception:
-        return []
-    pattern = re.compile(r'<div class="run-block" id="run-(\d+)-block">', re.DOTALL)
-    matches = list(pattern.finditer(content))
-    blocks = []
-    for i, m in enumerate(matches):
-        num = int(m.group(1))
-        start = m.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else content.find("</body>", start)
-        if end == -1:
-            end = len(content)
-        block = content[start:end].rstrip()
-        if num == current_num:
-            continue
-        blocks.append((num, block))
-    return blocks
-
-
-def build_site_html_with_history(site_key, current_block, current_num, base_url):
+def save_run_json(site_key, scan_data):
     site_dir = RESULTS_DIR / site_key
-    site_file = site_dir / f"{site_key}.html"
-    old_blocks = extract_old_run_blocks(site_file, current_num)
-    all_nums = sorted(set([n for n, _ in old_blocks] + [current_num]))
+    site_dir.mkdir(parents=True, exist_ok=True)
+    run_file = site_dir / f"run_{scan_data['scan_number']}.json"
+    with open(run_file, "w", encoding="utf-8") as f:
+        json.dump(scan_data, f, indent=2, ensure_ascii=False)
 
+
+def load_all_runs(site_key):
+    site_dir = RESULTS_DIR / site_key
+    if not site_dir.exists():
+        return []
+    runs = []
+    for rf in sorted(site_dir.glob("run_*.json")):
+        try:
+            with open(rf, encoding="utf-8") as f:
+                runs.append(json.load(f))
+        except Exception:
+            pass
+    return runs
+
+
+def build_site_html_from_json(site_key, runs):
     parts = [HTML_HEAD.format(title=f"Secret-JS - {esc(site_key)}")]
     parts.append('<a id="top"></a>')
     parts.append('<div class="top-nav">')
     parts.append(f'<h1 style="margin:0;">📑 Secret-JS - {esc(site_key)}</h1>')
     parts.append('</div>')
 
-    if len(all_nums) >= 1:
+    if runs:
         parts.append('<div class="toc">')
         parts.append(f'<b>Runs of {esc(site_key)}:</b><br>')
-        for n in all_nums:
+        for run in runs:
+            n = run["scan_number"]
             parts.append(f'<a href="#run-{n}">{esc(site_key)} — Run {n}</a>')
         parts.append('</div>')
 
-    for n, block in sorted(old_blocks, key=lambda x: x[0]):
-        parts.append(block)
-    parts.append(current_block)
+    for run in runs:
+        parts.append(render_run_section(run, site_key, include_anchor=True))
+
     parts.append(HTML_FOOT)
     return "\n".join(parts)
 
@@ -466,6 +643,7 @@ def save_site_files():
     site_key = LIVE["site_key"]
     site_dir = RESULTS_DIR / site_key
     site_dir.mkdir(parents=True, exist_ok=True)
+
     current_scan = {
         "scan_number": LIVE["scan_number"],
         "target_url": LIVE["target_url"],
@@ -476,10 +654,11 @@ def save_site_files():
         "findings": list(LIVE["findings"]),
         "endpoints": list(LIVE["endpoints"]),
     }
-    current_block = render_run_section(current_scan, site_key, include_anchor=True)
-    html_content = build_site_html_with_history(
-        site_key, current_block, LIVE["scan_number"], LIVE["target_url"]
-    )
+
+    save_run_json(site_key, current_scan)
+    runs = load_all_runs(site_key)
+
+    html_content = build_site_html_from_json(site_key, runs)
     site_file = site_dir / f"{site_key}.html"
     with open(site_file, "w", encoding="utf-8") as f:
         f.write(html_content)
@@ -517,32 +696,28 @@ def export_txt():
     site_dir = RESULTS_DIR / site_key
     site_dir.mkdir(parents=True, exist_ok=True)
     txt_file = site_dir / f"{site_key}_run{LIVE['scan_number']}.txt"
-    lines = []
-    lines.append(f"SecretHunter-JS Report")
-    lines.append(f"Site Key: {site_key}")
-    lines.append(f"Run: {LIVE['scan_number']}")
-    lines.append(f"Target: {LIVE['target_url']}")
-    lines.append(f"Started: {LIVE['started_at']}")
-    lines.append(f"Finished: {LIVE['finished_at']}")
-    lines.append(f"Status: {LIVE['status']}")
-    lines.append("")
-    lines.append(f"=== FILES ({len(LIVE['files'])}) ===")
-    for f in LIVE["files"]:
-        lines.append(f)
-    lines.append("")
-    lines.append(f"=== FINDINGS ({len(LIVE['findings'])}) ===")
-    for f in sorted(LIVE["findings"], key=lambda x: ["critical", "high", "medium", "low", "info"].index(x.get("severity", "low"))):
-        lines.append(f"[{f['severity'].upper()}] [{f['type']}] {f['value']}")
-        if f.get("file"):
-            lines.append(f"    File: {f['file']}")
-        if f.get("context"):
-            lines.append(f"    Context: {f['context']}")
-    lines.append("")
-    lines.append(f"=== ENDPOINTS ({len(LIVE['endpoints'])}) ===")
-    for e in LIVE["endpoints"]:
-        lines.append(e)
+    sev_order = ["critical", "high", "medium", "low", "info"]
     with open(txt_file, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+        f.write("SecretHunter-JS Report\n")
+        f.write(f"Site Key: {site_key}\n")
+        f.write(f"Run: {LIVE['scan_number']}\n")
+        f.write(f"Target: {LIVE['target_url']}\n")
+        f.write(f"Started: {LIVE['started_at']}\n")
+        f.write(f"Finished: {LIVE['finished_at']}\n")
+        f.write(f"Status: {LIVE['status']}\n\n")
+        f.write(f"=== FILES ({len(LIVE['files'])}) ===\n")
+        for fl in LIVE["files"]:
+            f.write(f"{fl}\n")
+        f.write(f"\n=== FINDINGS ({len(LIVE['findings'])}) ===\n")
+        for fd in sorted(LIVE["findings"], key=lambda x: sev_order.index(x.get("severity", "low"))):
+            f.write(f"[{fd['severity'].upper()}] [{fd['type']}] {fd['value']}\n")
+            if fd.get("file"):
+                f.write(f"    File: {fd['file']}\n")
+            if fd.get("context"):
+                f.write(f"    Context: {fd['context']}\n")
+        f.write(f"\n=== ENDPOINTS ({len(LIVE['endpoints'])}) ===\n")
+        for ep in LIVE["endpoints"]:
+            f.write(f"{ep}\n")
     print(f"[+] TXT exported: {txt_file}")
 
 
@@ -558,12 +733,14 @@ def finalize_live():
 def calculate_entropy(data):
     if not data:
         return 0
-    entropy = 0
-    for x in range(256):
-        p_x = data.count(chr(x)) / len(data)
-        if p_x > 0:
-            entropy += -p_x * math.log2(p_x)
-    return entropy
+    counts = Counter(data)
+    length = len(data)
+    return -sum((c / length) * math.log2(c / length) for c in counts.values())
+
+
+@lru_cache(maxsize=10000)
+def calculate_entropy_cached(data):
+    return calculate_entropy(data)
 
 
 def scan_binary_content(content, file_url):
@@ -573,7 +750,7 @@ def scan_binary_content(content, file_url):
             for match in text_matches:
                 try:
                     text = match.decode('utf-8', errors='ignore')
-                    if any(keyword.replace(r'\\', '').lower() in text.lower() for keyword in KEYWORDS):
+                    if any(kw.replace(r'\\', '').lower() in text.lower() for kw in KEYWORDS):
                         print(f"  [FOUND IN IMAGE] {text[:100]}...")
                         add_finding("image_text", text[:200], file_url)
                 except Exception:
@@ -583,6 +760,8 @@ def scan_binary_content(content, file_url):
 
 
 def beautify_js(content):
+    if len(content) > MAX_BEAUTIFY_SIZE:
+        return content
     if HAS_JSBEAUTIFIER:
         try:
             opts = jsbeautifier.default_options()
@@ -590,7 +769,7 @@ def beautify_js(content):
             return jsbeautifier.beautify(content, opts)
         except Exception:
             pass
-    if len(content) > 5000 and content.count('\n') < 50:
+    if len(content) > 5000 and content[:100000].count('\n') < 50:
         content = re.sub(r'([;{}])', r'\1\n', content)
     return content
 
@@ -599,6 +778,8 @@ def find_source_maps(content, file_url):
     matches = re.findall(r'//[#@]\s*sourceMappingURL=(\S+)', content)
     for sm in matches:
         sm_url = urljoin(file_url, sm)
+        if not is_safe_url(sm_url):
+            continue
         print(f"  [SOURCE MAP] {sm_url}")
         add_finding("source_map", sm_url, file_url, "Source map may expose original code")
         try:
@@ -618,6 +799,8 @@ def find_source_maps(content, file_url):
             elif r and r.status_code == 404:
                 for sg in ['/src/', '/app/', '/js/', '/source/', '/sources/']:
                     test_url = urljoin(file_url, sg)
+                    if not is_safe_url(test_url):
+                        continue
                     rr = fetch_with_backoff(test_url, retries=1, timeout=5)
                     if rr and rr.status_code == 200:
                         print(f"    [+] Source dir guess accessible: {test_url}")
@@ -633,8 +816,9 @@ def try_source_map_variants(js_url):
         candidates.append(js_url + ".map")
     else:
         candidates.append(js_url + ".map")
+    candidates = list(dict.fromkeys(candidates))
     for sm_url in candidates:
-        if is_excluded(sm_url):
+        if is_excluded(sm_url) or not is_safe_url(sm_url):
             continue
         r = fetch_with_backoff(sm_url, retries=1, timeout=8)
         if r and r.status_code == 200 and r.text.strip().startswith("{"):
@@ -667,8 +851,7 @@ def analyze_jwt_token(token, source_url=""):
         alg = str(header_data.get('alg', '')).lower()
         if alg == 'none':
             print(f"  [JWT ALG=NONE] {token[:40]}...")
-            add_finding("jwt_alg_none", token[:80], source_url,
-                        "JWT with alg=none - CRITICAL")
+            add_finding("jwt_alg_none", token[:80], source_url, "JWT with alg=none - CRITICAL")
         elif alg.startswith('hs'):
             add_finding("jwt_hmac", token[:80], source_url,
                         f"JWT uses {header_data.get('alg')} (HMAC)")
@@ -691,16 +874,8 @@ def check_firebase_exposure(content, source_url):
         if is_false_positive(db_url):
             continue
         print(f"  [FIREBASE DB] {db_url}")
-        add_finding("firebase_db", db_url, source_url, "Firebase database URL detected")
-        try:
-            test_url = db_url.rstrip("/") + "/.json"
-            r = requests.get(test_url, timeout=5, verify=VERIFY_SSL)
-            if r.status_code == 200 and r.text.strip() not in ("null", ""):
-                print(f"    [CRITICAL] Firebase DB is publicly readable!")
-                add_finding("firebase_open_db", test_url, source_url,
-                            "Firebase Realtime DB allows public read!")
-        except Exception:
-            pass
+        add_finding("firebase_db", db_url, source_url,
+                    "Firebase database URL detected — verify rules manually")
 
     for m in re.finditer(ADVANCED_PATTERNS['firebase_storage'], content, re.IGNORECASE):
         add_finding("firebase_storage", m.group(0), source_url,
@@ -721,9 +896,10 @@ def check_firebase_exposure(content, source_url):
 
 def check_cors(target_url):
     try:
-        r = requests.get(target_url,
-                         headers={'Origin': 'https://evil-attacker.com'},
-                         timeout=8, verify=VERIFY_SSL)
+        r = SESSION.get(target_url,
+                        headers={'Origin': 'https://evil-attacker.com',
+                                 'User-Agent': random.choice(USER_AGENTS)},
+                        timeout=8, verify=VERIFY_SSL)
         acao = r.headers.get('Access-Control-Allow-Origin', '')
         acac = r.headers.get('Access-Control-Allow-Credentials', '')
         if acao == '*' and acac.lower() == 'true':
@@ -750,6 +926,12 @@ def check_security_headers(target_url, response):
 
 
 def check_graphql_introspection(base_url, content=""):
+    domain = urlparse(base_url).netloc
+    with _graphql_lock:
+        if domain in _graphql_checked_domains:
+            return
+        _graphql_checked_domains.add(domain)
+
     candidates = set()
     for m in re.finditer(GRAPHQL_PATTERNS['graphql_endpoint'], content):
         candidates.add(urljoin(base_url, m.group(1)))
@@ -757,13 +939,14 @@ def check_graphql_introspection(base_url, content=""):
         candidates.add(urljoin(base_url, p))
 
     for gql_url in candidates:
-        if is_excluded(gql_url):
+        if is_excluded(gql_url) or not is_safe_url(gql_url):
             continue
         try:
-            r = requests.post(gql_url,
-                              json={"query": "{__schema{types{name}}}"},
-                              timeout=6, verify=VERIFY_SSL,
-                              headers={'Content-Type': 'application/json'})
+            r = SESSION.post(gql_url,
+                             json={"query": "{__schema{types{name}}}"},
+                             timeout=6, verify=VERIFY_SSL,
+                             headers={'Content-Type': 'application/json',
+                                      'User-Agent': random.choice(USER_AGENTS)})
             if r.status_code == 200 and '__schema' in r.text:
                 add_finding("graphql_introspection_enabled", gql_url, "",
                             "GraphQL introspection is enabled - full schema exposed")
@@ -804,54 +987,56 @@ def classify_endpoint_risk(ep):
 
 
 def validate_secret(finding_type, value):
+    if not VALIDATE_SECRETS:
+        return None
     try:
         if finding_type == 'github_token':
-            r = requests.get('https://api.github.com/user',
-                             headers={'Authorization': f'token {value}'},
-                             timeout=5, verify=VERIFY_SSL)
+            r = SESSION.get('https://api.github.com/user',
+                            headers={'Authorization': f'token {value}'},
+                            timeout=5, verify=VERIFY_SSL)
             return r.status_code == 200
         if finding_type == 'slack_token':
-            r = requests.post('https://slack.com/api/auth.test',
-                              headers={'Authorization': f'Bearer {value}'},
-                              timeout=5, verify=VERIFY_SSL)
+            r = SESSION.post('https://slack.com/api/auth.test',
+                             headers={'Authorization': f'Bearer {value}'},
+                             timeout=5, verify=VERIFY_SSL)
             return r.status_code == 200 and r.json().get('ok', False)
         if finding_type == 'openai_key':
-            r = requests.get('https://api.openai.com/v1/models',
-                             headers={'Authorization': f'Bearer {value}'},
-                             timeout=5, verify=VERIFY_SSL)
+            r = SESSION.get('https://api.openai.com/v1/models',
+                            headers={'Authorization': f'Bearer {value}'},
+                            timeout=5, verify=VERIFY_SSL)
             return r.status_code == 200
         if finding_type == 'stripe_live':
-            r = requests.get('https://api.stripe.com/v1/charges',
-                             headers={'Authorization': f'Bearer {value}'},
-                             timeout=5, verify=VERIFY_SSL)
+            r = SESSION.get('https://api.stripe.com/v1/charges',
+                            headers={'Authorization': f'Bearer {value}'},
+                            timeout=5, verify=VERIFY_SSL)
             return r.status_code in (200, 403) and 'api_key' not in r.text.lower()
         if finding_type == 'google_api':
-            r = requests.get(f'https://maps.googleapis.com/maps/api/geocode/json?address=test&key={value}',
-                             timeout=5, verify=VERIFY_SSL)
+            r = SESSION.get(f'https://maps.googleapis.com/maps/api/geocode/json?address=test&key={value}',
+                            timeout=5, verify=VERIFY_SSL)
             return r.status_code == 200 and 'error_message' not in r.text.lower()
         if finding_type == 'npm_token':
-            r = requests.get('https://registry.npmjs.org/-/whoami',
-                             headers={'Authorization': f'Bearer {value}'},
-                             timeout=5, verify=VERIFY_SSL)
+            r = SESSION.get('https://registry.npmjs.org/-/whoami',
+                            headers={'Authorization': f'Bearer {value}'},
+                            timeout=5, verify=VERIFY_SSL)
             return r.status_code == 200
         if finding_type == 'digitalocean_token':
-            r = requests.get('https://api.digitalocean.com/v2/account',
-                             headers={'Authorization': f'Bearer {value}'},
-                             timeout=5, verify=VERIFY_SSL)
+            r = SESSION.get('https://api.digitalocean.com/v2/account',
+                            headers={'Authorization': f'Bearer {value}'},
+                            timeout=5, verify=VERIFY_SSL)
             return r.status_code == 200
         if finding_type == 'huggingface_token':
-            r = requests.get('https://huggingface.co/api/whoami-v2',
-                             headers={'Authorization': f'Bearer {value}'},
-                             timeout=5, verify=VERIFY_SSL)
+            r = SESSION.get('https://huggingface.co/api/whoami-v2',
+                            headers={'Authorization': f'Bearer {value}'},
+                            timeout=5, verify=VERIFY_SSL)
             return r.status_code == 200
         if finding_type == 'mapbox_token':
-            r = requests.get(f'https://api.mapbox.com/tokens/v2?access_token={value}',
-                             timeout=5, verify=VERIFY_SSL)
+            r = SESSION.get(f'https://api.mapbox.com/tokens/v2?access_token={value}',
+                            timeout=5, verify=VERIFY_SSL)
             return r.status_code == 200
         if finding_type == 'replicate_token':
-            r = requests.get('https://api.replicate.com/v1/account',
-                             headers={'Authorization': f'Token {value}'},
-                             timeout=5, verify=VERIFY_SSL)
+            r = SESSION.get('https://api.replicate.com/v1/account',
+                            headers={'Authorization': f'Token {value}'},
+                            timeout=5, verify=VERIFY_SSL)
             return r.status_code == 200
     except Exception:
         return False
@@ -870,20 +1055,25 @@ def extract_bundler_chunks(content, file_url):
     return chunks
 
 
-def analyze_javascript(file_url):
+def analyze_javascript(file_url, content=None):
     try:
-        res = fetch_with_backoff(file_url, retries=2, timeout=10)
-        if not res or res.status_code != 200:
-            return None
-        content = res.text
+        if content is None:
+            res = fetch_with_backoff(file_url, retries=2, timeout=10)
+            if not res or res.status_code != 200:
+                return None
+            content = res.text
+
         find_source_maps(content, file_url)
         pretty = beautify_js(content)
+
         endpoints = re.findall(r'["\'](/api/[a-zA-Z0-9/_-]+)["\']', pretty)
         endpoints += re.findall(r'["\'](/v[0-9]+/[a-zA-Z0-9/_-]+)["\']', pretty)
         unique_endpoints = list(set(endpoints))
+
         functions = re.findall(r'function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(', pretty)
         functions += re.findall(r'([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*function\s*\(', pretty)
         functions += re.findall(r'([a-zA-Z_$][a-zA-Z0-9_$]*)\s*:\s*function\s*\(', pretty)
+
         variables = re.findall(r'(?:var|let|const)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=', pretty)
         long_strings = re.findall(r'["\']([a-zA-Z0-9+/=]{40,})["\']', pretty)
 
@@ -905,15 +1095,15 @@ def analyze_javascript(file_url):
             print(f"  Sample functions: {functions[:5]}")
         if long_strings:
             for s in long_strings[:3]:
-                if calculate_entropy(s) > 4.5:
+                if calculate_entropy_cached(s) > 4.5:
                     print(f"  [HIGH ENTROPY STRING] {s[:50]}...")
                     add_finding("high_entropy_js", s[:120], file_url,
-                                f"Entropy: {calculate_entropy(s):.2f}")
+                                f"Entropy: {calculate_entropy_cached(s):.2f}")
 
         chunks = extract_bundler_chunks(pretty, file_url)
         for c in chunks:
             full = urljoin(file_url, c)
-            if is_excluded(full):
+            if is_excluded(full) or not is_safe_url(full):
                 continue
             r = fetch_with_backoff(full, retries=1, timeout=8)
             if r and r.status_code == 200:
@@ -939,9 +1129,10 @@ def analyze_javascript(file_url):
 
 def scan_content(content, file_url):
     h = content_hash(content)
-    if h in _seen_hashes:
-        return
-    _seen_hashes.add(h)
+    with _seen_lock:
+        if h in _seen_hashes:
+            return
+        _seen_hashes.add(h)
 
     decoded = decode_obfuscated(content)
     if decoded:
@@ -949,16 +1140,17 @@ def scan_content(content, file_url):
 
     print(f"\n[!] Scanning: {file_url}")
     found = False
-    keyword_pattern = re.compile('|'.join(KEYWORDS), re.IGNORECASE)
-    for match in re.finditer(keyword_pattern, content):
-        start = max(0, match.start() - 60)
-        end = min(len(content), match.end() + 60)
-        snippet = f"...{content[start:end]}..."
-        if is_false_positive(snippet):
-            continue
-        found = True
-        print(f"  [FOUND KEYWORD] '{match.group()}' at: {snippet}")
-        add_finding("keyword", match.group(), file_url, snippet)
+
+    if KEYWORD_PATTERN is not None:
+        for match in KEYWORD_PATTERN.finditer(content):
+            start = max(0, match.start() - 60)
+            end = min(len(content), match.end() + 60)
+            snippet = f"...{content[start:end]}..."
+            if is_false_positive(snippet):
+                continue
+            found = True
+            print(f"  [FOUND KEYWORD] '{match.group()}' at: {snippet}")
+            add_finding("keyword", match.group(), file_url, snippet)
 
     for pattern_name, pattern in ADVANCED_PATTERNS.items():
         for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
@@ -1001,19 +1193,19 @@ def scan_content(content, file_url):
 
     check_firebase_exposure(content, file_url)
 
-    words = re.findall(r'[\"\']([a-zA-Z0-9\-_/+=]{16,})[\"\']', content)
-    for word in words:
-        if is_false_positive(word):
-            continue
-        ent = calculate_entropy(word)
-        if ent > 4.5:
-            found = True
-            print(f"  [HIGH ENTROPY SECRET] '{word}' (Entropy: {ent:.2f})")
-            add_finding("high_entropy", word, file_url, f"Entropy: {ent:.2f}")
+    if len(content) < MAX_HEAVY_SCAN_SIZE:
+        for m in re.finditer(r'[\"\']([a-zA-Z0-9\-_/+=]{16,})[\"\']', content):
+            word = m.group(1)
+            if is_false_positive(word):
+                continue
+            ent = calculate_entropy_cached(word)
+            if ent > 4.5:
+                found = True
+                print(f"  [HIGH ENTROPY SECRET] '{word}' (Entropy: {ent:.2f})")
+                add_finding("high_entropy", word, file_url, f"Entropy: {ent:.2f}")
 
-    path_matches = re.finditer(PATH_PATTERN, content)
     unique_paths = set()
-    for match in path_matches:
+    for match in PATH_RE.finditer(content):
         raw_path = match.group().strip('"\'')
         if "//" in raw_path or raw_path == "/":
             continue
@@ -1054,7 +1246,7 @@ def scan_inline_scripts(soup, page_url):
 
 def scan_html_file(content, file_url):
     print(f"\n[!] Scanning HTML: {file_url}")
-    soup = BeautifulSoup(content, 'html.parser')
+    soup = BeautifulSoup(content, HTML_PARSER)
     scan_content(content, file_url)
     inline_count = 0
     for script in soup.find_all("script", src=False):
@@ -1081,7 +1273,7 @@ def scan_html_file(content, file_url):
 def run_initial_analysis(target_url, target_files):
     res = fetch_with_backoff(target_url, retries=2, timeout=10)
     if res and res.status_code == 200:
-        soup = BeautifulSoup(res.text, 'html.parser')
+        soup = BeautifulSoup(res.text, HTML_PARSER)
         scan_inline_scripts(soup, target_url)
         check_cors(target_url)
         check_graphql_introspection(target_url, res.text)
@@ -1094,16 +1286,22 @@ def check_common_paths(base_url):
 
     def check_one_path(p):
         url = urljoin(base_url, p)
-        if is_excluded(url):
+        if is_excluded(url) or not is_safe_url(url):
             return None
         try:
+            BUCKET.consume()
             with RATE_LIMIT:
-                r = requests.head(url, headers={'User-Agent': 'Mozilla/5.0'},
-                                  timeout=2, allow_redirects=True, verify=VERIFY_SSL)
-            if r.status_code == 405:
+                r = SESSION.head(url,
+                                 headers={'User-Agent': random.choice(USER_AGENTS)},
+                                 timeout=3, allow_redirects=True, verify=VERIFY_SSL)
+            if r.status_code in (400, 403, 405, 501):
+                BUCKET.consume()
                 with RATE_LIMIT:
-                    r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'},
-                                     timeout=2, allow_redirects=True, verify=VERIFY_SSL)
+                    r = SESSION.get(url,
+                                    headers={'User-Agent': random.choice(USER_AGENTS)},
+                                    timeout=3, allow_redirects=True,
+                                    stream=True, verify=VERIFY_SSL)
+                r.close()
             if r.status_code in (200, 301, 302, 401, 403):
                 return (r.status_code, url, r.url)
         except Exception:
@@ -1123,14 +1321,66 @@ def check_common_paths(base_url):
                     add_file(final_url)
 
 
+def extract_file_refs(text, base_url):
+    refs = set()
+    for m in re.finditer(rf"[\"']([a-zA-Z0-9\-_./]+\.{EXT_REGEX_STR})[\"']", text, re.IGNORECASE):
+        refs.add(urljoin(base_url, m.group(1)))
+    return refs
+
+
+def crawl_bfs(seeds, max_depth=2, max_files=500, batch=20):
+    seen = set(seeds)
+    queue = deque((s, 0) for s in seeds)
+    results = set(seeds)
+
+    def fetch_text(u):
+        try:
+            r = fetch_with_backoff(u, retries=1, timeout=6)
+            if r and r.status_code == 200:
+                return r.text
+        except Exception:
+            pass
+        return None
+
+    while queue and len(results) < max_files:
+        level = []
+        while queue and len(level) < batch:
+            url, depth = queue.popleft()
+            if depth < max_depth:
+                level.append((url, depth))
+        if not level:
+            break
+
+        with ThreadPoolExecutor(max_workers=min(batch, 15)) as ex:
+            futures = {ex.submit(fetch_text, u): (u, d) for u, d in level}
+            for fut in as_completed(futures):
+                url, depth = futures[fut]
+                try:
+                    text = fut.result()
+                except Exception:
+                    text = None
+                if not text:
+                    continue
+                for sub in extract_file_refs(text, url):
+                    if sub in seen or len(results) >= max_files:
+                        continue
+                    if '.css' in sub.lower() or is_excluded(sub):
+                        continue
+                    seen.add(sub)
+                    results.add(sub)
+                    queue.append((sub, depth + 1))
+    return list(results)
+
+
 def get_target_files(target_url):
     try:
         response = fetch_with_backoff(target_url, retries=2, timeout=10)
         if not response or response.status_code != 200:
-            print(f"[-] Failed to connect.")
+            print("[-] Failed to connect.")
             return []
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(response.text, HTML_PARSER)
         target_files = set()
+
         for tag in soup.find_all(['script', 'link', 'a', 'iframe']):
             for attr in ['src', 'href', 'data-src', 'data-url']:
                 val = tag.get(attr)
@@ -1143,32 +1393,14 @@ def get_target_files(target_url):
                             if not is_excluded(full_url):
                                 target_files.add(full_url)
 
-        text_content = response.text
-        potential_paths = re.findall(rf"[\"']([a-zA-Z0-9\-_./]+\.{EXT_REGEX_STR})[\"']",
-                                     text_content, re.IGNORECASE)
-        for p in potential_paths:
+        for p in re.findall(rf"[\"']([a-zA-Z0-9\-_./]+\.{EXT_REGEX_STR})[\"']",
+                            response.text, re.IGNORECASE):
             full = urljoin(target_url, p)
             if not is_excluded(full):
                 target_files.add(full)
 
-        def crawl_recursive(file_url, depth=1):
-            if depth > 2:
-                return
-            res = fetch_with_backoff(file_url, retries=1, timeout=5)
-            if res and res.status_code == 200:
-                sub_matches = re.findall(
-                    rf"[\"']([a-zA-Z0-9\-_./]+\.{EXT_REGEX_STR})[\"']",
-                    res.text, re.IGNORECASE)
-                parsed_base = urlparse(file_url)
-                base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
-                for sub_file in sub_matches:
-                    full_sub_url = urljoin(base_origin, sub_file)
-                    if full_sub_url not in target_files and '.css' not in full_sub_url.lower() and not is_excluded(full_sub_url):
-                        target_files.add(full_sub_url)
-                        crawl_recursive(full_sub_url, depth + 1)
-
-        for initial_file in list(target_files):
-            crawl_recursive(initial_file)
+        crawled = crawl_bfs(list(target_files), max_depth=2, max_files=500)
+        target_files.update(crawled)
 
         if target_url not in target_files:
             target_files.add(target_url)
@@ -1179,7 +1411,7 @@ def get_target_files(target_url):
 
         check_common_paths(target_url)
 
-        print(f"\n[+] Found {len(file_list)} target files (Scripts, HTML, Configs, Logs, Backups, etc.):\n")
+        print(f"\n[+] Found {len(file_list)} target files:\n")
         for i, f in enumerate(file_list, 1):
             print(f"[{i}] {f}")
         return file_list
@@ -1212,10 +1444,10 @@ def analyze_single_file(file_list):
                 else:
                     scan_content(res.text, target_file)
                 if lower.endswith('.js'):
-                    analyze_javascript(target_file)
+                    analyze_javascript(target_file, content=res.text)
                 save_site_files()
             else:
-                print(f"[-] Failed to fetch file.")
+                print("[-] Failed to fetch file.")
         else:
             print("[-] Invalid selection.")
     except Exception as e:
@@ -1230,36 +1462,44 @@ def advanced_search(file_list):
     if not custom_input:
         print("[-] No keywords entered.")
         return
-    custom_keywords = [kw.strip() for kw in custom_input.split(',')]
+    custom_keywords = [kw.strip() for kw in custom_input.split(',') if kw.strip()]
     print(f"\n[+] Searching for: {', '.join(custom_keywords)}")
     results = {}
     total_checked = 0
-    for file_url in file_list:
-        res = fetch_with_backoff(file_url, retries=1, timeout=5)
-        total_checked += 1
+
+    def scan_one(file_url):
+        res = fetch_with_backoff(file_url, retries=1, timeout=6)
+        local = []
         if res and res.status_code == 200:
-            lines = res.text.splitlines()
-            found_matches = []
-            for line_num, line in enumerate(lines, 1):
+            for line_num, line in enumerate(res.text.splitlines(), 1):
                 line_lower = line.lower()
-                found_keywords = [kw for kw in custom_keywords if kw.lower() in line_lower]
-                if found_keywords:
+                found_kw = [kw for kw in custom_keywords if kw.lower() in line_lower]
+                if found_kw:
                     clean_line = line.strip()[:100]
                     if len(line.strip()) > 100:
                         clean_line += "..."
-                    found_matches.append({
-                        'keywords': found_keywords,
+                    local.append({
+                        'keywords': found_kw,
                         'line_number': line_num,
-                        'content': clean_line
+                        'content': clean_line,
                     })
                     print(f"  [FOUND] {file_url} -> Line {line_num}: {clean_line}")
-                    print(f"    Keywords: {', '.join(found_keywords)}")
-                    add_finding("custom_search", ", ".join(found_keywords), file_url,
+                    print(f"    Keywords: {', '.join(found_kw)}")
+                    add_finding("custom_search", ", ".join(found_kw), file_url,
                                 f"Line {line_num}: {clean_line}")
-            if found_matches:
-                results[file_url] = found_matches
-        else:
-            print(f"  [!] Could not fetch: {file_url}")
+        return file_url, local
+
+    with ThreadPoolExecutor(max_workers=15) as ex:
+        futures = [ex.submit(scan_one, f) for f in file_list]
+        for fut in as_completed(futures):
+            total_checked += 1
+            try:
+                url, matches = fut.result()
+                if matches:
+                    results[url] = matches
+            except Exception:
+                pass
+
     print(f"\n[+] Scanned {total_checked} files, found matches in {len(results)} files.")
     if not results:
         print("[-] No matches found.")
@@ -1274,16 +1514,17 @@ def analyze_all_files_optimized(file_list):
     print(f"\n[+] Starting optimized deep scan for {len(file_list)} files...")
     results = {}
 
-    def fetch_and_scan_with_retry(f_url, retries=2):
-        res = fetch_with_backoff(f_url, retries=retries, timeout=10)
-        if res and res.status_code == 200:
-            findings = []
-            print(f"\n[!] Scanning: {f_url}")
-            decoded = decode_obfuscated(res.text)
-            text = res.text + ("\n" + decoded if decoded else "")
+    def fetch_and_scan(f_url):
+        res = fetch_with_backoff(f_url, retries=2, timeout=10)
+        if not res or res.status_code != 200:
+            return f_url, []
+        findings = []
+        print(f"\n[!] Scanning: {f_url}")
+        decoded = decode_obfuscated(res.text)
+        text = res.text + ("\n" + decoded if decoded else "")
 
-            keyword_pattern = re.compile('|'.join(KEYWORDS), re.IGNORECASE)
-            for match in re.finditer(keyword_pattern, text):
+        if KEYWORD_PATTERN is not None:
+            for match in KEYWORD_PATTERN.finditer(text):
                 start = max(0, match.start() - 60)
                 end = min(len(text), match.end() + 60)
                 snippet = f"...{text[start:end]}..."
@@ -1293,63 +1534,63 @@ def analyze_all_files_optimized(file_list):
                 findings.append(f"keyword: {match.group()}")
                 add_finding("keyword", match.group(), f_url, snippet)
 
-            for pattern_name, pattern in ADVANCED_PATTERNS.items():
-                for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
-                    val = match.group()
-                    if is_false_positive(val):
+        for pattern_name, pattern in ADVANCED_PATTERNS.items():
+            for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
+                val = match.group()
+                if is_false_positive(val):
+                    continue
+                print(f"  [FOUND {pattern_name.upper()}] {val}")
+                findings.append(f"{pattern_name}: {val}")
+                add_finding(pattern_name, val, f_url)
+
+                if pattern_name in ('github_token', 'slack_token', 'openai_key', 'stripe_live',
+                                    'google_api', 'npm_token', 'digitalocean_token',
+                                    'huggingface_token', 'mapbox_token', 'replicate_token'):
+                    if validate_secret(pattern_name, val):
+                        add_finding("validated_secret", val, f_url,
+                                    f"LIVE {pattern_name} - validated")
+
+                if pattern_name == 'jwt_token':
+                    analyze_jwt_token(val, f_url)
+
+        for gql_name, gql_pat in GRAPHQL_PATTERNS.items():
+            for match in re.finditer(gql_pat, text):
+                if gql_name == 'graphql_endpoint':
+                    add_finding("graphql_endpoint", match.group(1), f_url)
+                    add_endpoint(match.group(1))
+                elif gql_name == 'graphql_query':
+                    add_finding("graphql_query", match.group()[:80], f_url)
+                elif gql_name == 'graphql_introspection':
+                    add_finding("graphql_introspection", match.group(), f_url)
+
+        check_firebase_exposure(text, f_url)
+        detect_vulnerable_libs(text, f_url)
+
+        lower = f_url.lower()
+        ctype = res.headers.get('Content-Type', '').lower()
+        if lower.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico')):
+            scan_binary_content(res.content, f_url)
+        elif lower.endswith(('.html', '.htm')) or 'text/html' in ctype:
+            scan_html_file(res.text, f_url)
+
+        if lower.endswith('.js'):
+            js_results = analyze_javascript(f_url, content=res.text)
+            if js_results:
+                findings.append(f"JS analysis: {len(js_results['functions'])} functions")
+                chunks = extract_bundler_chunks(res.text, f_url)
+                for c in chunks:
+                    full = urljoin(f_url, c)
+                    if is_excluded(full) or not is_safe_url(full):
                         continue
-                    print(f"  [FOUND {pattern_name.upper()}] {val}")
-                    findings.append(f"{pattern_name}: {val}")
-                    add_finding(pattern_name, val, f_url)
+                    rr = fetch_with_backoff(full, retries=1, timeout=8)
+                    if rr and rr.status_code == 200:
+                        scan_content(rr.text, full)
+                try_source_map_variants(f_url)
+        return f_url, findings
 
-                    if pattern_name in ('github_token', 'slack_token', 'openai_key', 'stripe_live',
-                                        'google_api', 'npm_token', 'digitalocean_token',
-                                        'huggingface_token', 'mapbox_token', 'replicate_token'):
-                        if validate_secret(pattern_name, val):
-                            add_finding("validated_secret", val, f_url,
-                                        f"LIVE {pattern_name} - validated")
-
-                    if pattern_name == 'jwt_token':
-                        analyze_jwt_token(val, f_url)
-
-            for gql_name, gql_pat in GRAPHQL_PATTERNS.items():
-                for match in re.finditer(gql_pat, text):
-                    if gql_name == 'graphql_endpoint':
-                        add_finding("graphql_endpoint", match.group(1), f_url)
-                        add_endpoint(match.group(1))
-                    elif gql_name == 'graphql_query':
-                        add_finding("graphql_query", match.group()[:80], f_url)
-                    elif gql_name == 'graphql_introspection':
-                        add_finding("graphql_introspection", match.group(), f_url)
-
-            check_firebase_exposure(text, f_url)
-            detect_vulnerable_libs(text, f_url)
-
-            lower = f_url.lower()
-            ctype = res.headers.get('Content-Type', '').lower()
-            if lower.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico')):
-                scan_binary_content(res.content, f_url)
-            elif lower.endswith(('.html', '.htm')) or 'text/html' in ctype:
-                scan_html_file(res.text, f_url)
-
-            if lower.endswith('.js'):
-                js_results = analyze_javascript(f_url)
-                if js_results:
-                    findings.append(f"JS analysis: {len(js_results['functions'])} functions")
-                    chunks = extract_bundler_chunks(res.text, f_url)
-                    for c in chunks:
-                        full = urljoin(f_url, c)
-                        if is_excluded(full):
-                            continue
-                        rr = fetch_with_backoff(full, retries=1, timeout=8)
-                        if rr and rr.status_code == 200:
-                            scan_content(rr.text, full)
-                    try_source_map_variants(f_url)
-            return f_url, findings
-        return f_url, []
-
-    with ThreadPoolExecutor(max_workers=15) as executor:
-        future_to_url = {executor.submit(fetch_and_scan_with_retry, f): f for f in file_list}
+    workers = min(15, max(5, len(file_list)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_url = {executor.submit(fetch_and_scan, f): f for f in file_list}
         for future in as_completed(future_to_url):
             url = future_to_url[future]
             try:
@@ -1365,50 +1606,60 @@ def analyze_all_files_optimized(file_list):
 
 
 def show_paths(target_url, file_list):
-    print(f"\n[+] Extracting internal endpoints from index page and target files...")
+    print("\n[+] Extracting internal endpoints from index page and target files...")
     unique_full_paths = set()
     parsed_base = urlparse(target_url)
     base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
 
     index_res = fetch_with_backoff(target_url, retries=2, timeout=5)
     if index_res and index_res.status_code == 200:
-        for match in re.finditer(PATH_PATTERN, index_res.text):
+        for match in PATH_RE.finditer(index_res.text):
             raw_path = match.group().strip('"\'')
             if "//" in raw_path or raw_path == "/":
                 continue
             unique_full_paths.add(urljoin(base_origin, raw_path))
 
     def extract_paths(f_url):
-        local_paths = set()
+        local = set()
         res = fetch_with_backoff(f_url, retries=1, timeout=5)
         if res and res.status_code == 200:
-            for match in re.finditer(PATH_PATTERN, res.text):
+            for match in PATH_RE.finditer(res.text):
                 raw_path = match.group().strip('"\'')
                 if "//" in raw_path or raw_path == "/":
                     continue
-                local_paths.add(urljoin(base_origin, raw_path))
-        return local_paths
+                local.add(urljoin(base_origin, raw_path))
+        return local
 
     if file_list:
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = [executor.submit(extract_paths, f) for f in file_list]
             for future in as_completed(futures):
-                unique_full_paths.update(future.result())
+                try:
+                    unique_full_paths.update(future.result())
+                except Exception:
+                    pass
 
     if unique_full_paths:
         print(f"\n[+] Checking status codes for {len(unique_full_paths)} extracted endpoints:\n")
 
         def check_status(path):
             try:
+                BUCKET.consume()
                 with RATE_LIMIT:
-                    response = requests.head(path, headers={'User-Agent': 'Mozilla/5.0'},
-                                             timeout=5, allow_redirects=True, verify=VERIFY_SSL)
+                    response = SESSION.head(path,
+                                            headers={'User-Agent': random.choice(USER_AGENTS)},
+                                            timeout=5, allow_redirects=True,
+                                            verify=VERIFY_SSL)
                 status_code = response.status_code
-                if status_code in (405, 403):
+                if status_code in (400, 403, 405, 501):
+                    BUCKET.consume()
                     with RATE_LIMIT:
-                        response = requests.get(path, headers={'User-Agent': 'Mozilla/5.0'},
-                                                timeout=5, stream=True, verify=VERIFY_SSL)
+                        response = SESSION.get(path,
+                                               headers={'User-Agent': random.choice(USER_AGENTS)},
+                                               timeout=5, stream=True,
+                                               verify=VERIFY_SSL)
                     status_code = response.status_code
+                    response.close()
                 return status_code, path
             except Exception:
                 return "ERR", path
@@ -1481,6 +1732,10 @@ if __name__ == "__main__":
     url = input("Enter target URL : ").strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+
+    if not is_safe_url(url):
+        print("[-] Target URL is blocked (SSRF protection).")
+        raise SystemExit(1)
 
     site_key = extract_site_key(url)
 
