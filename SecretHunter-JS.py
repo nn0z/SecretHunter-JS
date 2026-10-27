@@ -12,6 +12,7 @@ import ipaddress
 import socket
 import threading
 import random
+import configparser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Semaphore, Lock
 from collections import Counter, deque
@@ -51,12 +52,75 @@ except ImportError:
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-VERIFY_SSL = os.getenv("SECRETHUNTER_VERIFY_SSL", "false").lower() == "true"
-VALIDATE_SECRETS = os.getenv("SECRETHUNTER_VALIDATE_SECRETS", "false").lower() == "true"
+
+_CFG_DEFAULTS = {
+    "validate_secrets": False,
+    "i_have_authorization": False,
+    "no_cache": False,
+    "restrict_to_target_domain": True,
+}
+_CFG_TRUE = {"yes", "true", "1", "on", "y", "نعم"}
+_CFG_FALSE = {"no", "false", "0", "off", "n", "لا"}
+
+
+def _cfg_bool(raw, default=False):
+    if raw is None:
+        return default
+    v = str(raw).strip().lower()
+    if v in _CFG_TRUE:
+        return True
+    if v in _CFG_FALSE:
+        return False
+    return default
+
+
+def _load_config():
+    ini_path = Path(os.getenv("SECRETHUNTER_CONFIG", "config.ini"))
+    ini = {}
+    if ini_path.exists():
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(ini_path, encoding="utf-8")
+            if "settings" in parser:
+                ini = dict(parser["settings"])
+        except Exception as e:
+            print(f"[!] Could not read {ini_path}: {e}")
+
+    cfg = dict(_CFG_DEFAULTS)
+    for key in _CFG_DEFAULTS:
+        if isinstance(_CFG_DEFAULTS[key], bool):
+            cfg[key] = _cfg_bool(ini.get(key), _CFG_DEFAULTS[key])
+
+    if cfg["validate_secrets"] and not cfg["i_have_authorization"]:
+        print("[!] config.ini: validate_secrets = yes but i_have_authorization = no.")
+        print("    Secret validation will be DISABLED for this run.")
+        cfg["validate_secrets"] = False
+
+    return cfg
+
+
+CONFIG = _load_config()
+
+VALIDATE_SECRETS          = CONFIG["validate_secrets"]
+HAS_AUTHORIZATION         = CONFIG["i_have_authorization"]
+NO_CACHE                  = CONFIG["no_cache"]
+RESTRICT_TO_TARGET_DOMAIN = CONFIG["restrict_to_target_domain"]
+
+VERIFY_SSL          = False
+ENABLE_COMMON_PATHS = True
+ENABLE_GRAPHQL      = True
+ENABLE_CORS         = True
+PROBE_FIREBASE      = False
+HAS_AUTH_FIREBASE   = False
+ENABLE_BINARY_SCAN  = True
+MAX_DOWNLOAD_BYTES  = 5 * 1024 * 1024
+RATE_LIMIT_PER_SEC  = 5
+MAX_WORKERS         = 15
 
 RATE_LIMIT = Semaphore(20)
 _seen_hashes = set()
 _seen_lock = Lock()
+_save_lock = Lock()
 _graphql_checked_domains = set()
 _graphql_lock = Lock()
 
@@ -68,6 +132,7 @@ RESULTS_DIR = Path("results")
 CACHE_DIR = Path(".secrethunter_cache")
 MAX_DECODE_CHUNKS = 50
 MAX_DECODE_TOTAL = 500_000
+MAX_DECODE_INPUT = 2 * 1024 * 1024
 MAX_HEAVY_SCAN_SIZE = 2 * 1024 * 1024
 MAX_BEAUTIFY_SIZE = 2 * 1024 * 1024
 
@@ -133,7 +198,7 @@ class TokenBucket:
             time.sleep(wait)
 
 
-BUCKET = TokenBucket(rate=5.0, capacity=10)
+BUCKET = TokenBucket(rate=float(RATE_LIMIT_PER_SEC), capacity=RATE_LIMIT_PER_SEC * 2)
 
 
 def make_session():
@@ -147,10 +212,26 @@ def make_session():
 
 SESSION = make_session()
 
-if HAS_DISKCACHE:
-    CACHE = diskcache.Cache(str(CACHE_DIR), size_limit=500 * 1024 * 1024)
-else:
-    CACHE = None
+
+def _init_cache():
+    if NO_CACHE:
+        print("[*] Disk cache disabled (config.ini: no_cache = yes).")
+        return None
+    if not HAS_DISKCACHE:
+        return None
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(CACHE_DIR, 0o700)
+        except Exception:
+            pass
+        return diskcache.Cache(str(CACHE_DIR), size_limit=500 * 1024 * 1024)
+    except Exception as e:
+        print(f"[!] Could not initialize cache: {e}")
+        return None
+
+
+CACHE = _init_cache()
 
 
 def clear_screen():
@@ -189,18 +270,20 @@ def extract_site_key(url):
 
 @lru_cache(maxsize=50000)
 def esc(s):
-    return html_lib.escape(str(s))
+    return html_lib.escape(str(s), quote=True)
 
 
 def make_clickable(value, base_url=None):
     v = str(value).strip()
+    if v.lower().startswith(('javascript:', 'data:', 'vbscript:')):
+        return esc(v)
     if v.startswith(("http://", "https://")):
-        return f'<a href="{esc(v)}" target="_blank" rel="noopener">{esc(v)}</a>'
+        return f'<a href="{esc(v)}" target="_blank" rel="noopener noreferrer">{esc(v)}</a>'
     if v.startswith("/") and base_url:
         full = base_url.rstrip("/") + v
-        return f'<a href="{esc(full)}" target="_blank" rel="noopener">{esc(v)}</a>'
+        return f'<a href="{esc(full)}" target="_blank" rel="noopener noreferrer">{esc(v)}</a>'
     if v.startswith("/"):
-        return f'<a href="{esc(v)}" target="_blank" rel="noopener">{esc(v)}</a>'
+        return f'<a href="{esc(v)}" target="_blank" rel="noopener noreferrer">{esc(v)}</a>'
     return esc(v)
 
 
@@ -269,14 +352,42 @@ def is_safe_url(url):
         host = p.hostname
         if not host or host.lower() in BLOCKED_HOSTS:
             return False
+
         try:
             ip = ipaddress.ip_address(host)
+            return not any(ip in net for net in BLOCKED_NETS)
         except ValueError:
+            pass
+
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except Exception:
+            return False
+        if not infos:
+            return False
+
+        for info in infos:
+            addr = info[4][0].split('%', 1)[0]
             try:
-                ip = ipaddress.ip_address(socket.gethostbyname(host))
-            except Exception:
-                return True
-        return not any(ip in net for net in BLOCKED_NETS)
+                ip = ipaddress.ip_address(addr)
+            except ValueError:
+                return False
+            if any(ip in net for net in BLOCKED_NETS):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def is_same_target(url, target_url):
+    if not RESTRICT_TO_TARGET_DOMAIN:
+        return True
+    try:
+        target_host = (urlparse(target_url).hostname or "").lower()
+        host = (urlparse(url).hostname or "").lower()
+        if not host:
+            return False
+        return host == target_host or host.endswith("." + target_host)
     except Exception:
         return False
 
@@ -288,6 +399,9 @@ def content_hash(text):
 def decode_obfuscated(content):
     decoded_chunks = []
     total = 0
+
+    if len(content) > MAX_DECODE_INPUT:
+        content = content[:MAX_DECODE_INPUT]
 
     for m in re.finditer(r'atob\(["\']([A-Za-z0-9+/=]{16,})["\']\)', content):
         if len(decoded_chunks) >= MAX_DECODE_CHUNKS or total >= MAX_DECODE_TOTAL:
@@ -332,7 +446,9 @@ def decode_obfuscated(content):
     return "\n".join(decoded_chunks)
 
 
-def fetch_with_backoff(url, retries=3, timeout=10, stream=False, max_size=5 * 1024 * 1024):
+def fetch_with_backoff(url, retries=3, timeout=10, stream=False, max_size=None):
+    if max_size is None:
+        max_size = MAX_DOWNLOAD_BYTES
     if is_excluded(url):
         return None
     if not is_safe_url(url):
@@ -348,8 +464,9 @@ def fetch_with_backoff(url, retries=3, timeout=10, stream=False, max_size=5 * 10
                 r = requests.models.Response()
                 r.status_code = status
                 r._content = text.encode('utf-8', 'ignore')
-                r.headers.update(headers)
+                r.headers = requests.structures.CaseInsensitiveDict(headers)
                 r.url = url
+                r.encoding = 'utf-8'
                 return r
             except Exception:
                 pass
@@ -377,7 +494,7 @@ def fetch_with_backoff(url, retries=3, timeout=10, stream=False, max_size=5 * 10
                 wait = int(retry_after) if (retry_after and retry_after.isdigit()) else (2 ** i)
                 time.sleep(wait)
                 continue
-            if cache_key and r.status_code == 200 and not stream:
+            if cache_key and CACHE is not None and r.status_code == 200 and not stream:
                 try:
                     CACHE.set(cache_key, (r.text, r.status_code, dict(r.headers)), expire=3600)
                 except Exception:
@@ -638,30 +755,31 @@ def build_site_html_from_json(site_key, runs):
 
 
 def save_site_files():
-    if LIVE["site_key"] is None:
-        return
-    site_key = LIVE["site_key"]
-    site_dir = RESULTS_DIR / site_key
-    site_dir.mkdir(parents=True, exist_ok=True)
+    with _save_lock:
+        if LIVE["site_key"] is None:
+            return
+        site_key = LIVE["site_key"]
+        site_dir = RESULTS_DIR / site_key
+        site_dir.mkdir(parents=True, exist_ok=True)
 
-    current_scan = {
-        "scan_number": LIVE["scan_number"],
-        "target_url": LIVE["target_url"],
-        "started_at": LIVE["started_at"],
-        "finished_at": LIVE["finished_at"],
-        "status": LIVE["status"],
-        "files": list(LIVE["files"]),
-        "findings": list(LIVE["findings"]),
-        "endpoints": list(LIVE["endpoints"]),
-    }
+        current_scan = {
+            "scan_number": LIVE["scan_number"],
+            "target_url": LIVE["target_url"],
+            "started_at": LIVE["started_at"],
+            "finished_at": LIVE["finished_at"],
+            "status": LIVE["status"],
+            "files": list(LIVE["files"]),
+            "findings": list(LIVE["findings"]),
+            "endpoints": list(LIVE["endpoints"]),
+        }
 
-    save_run_json(site_key, current_scan)
-    runs = load_all_runs(site_key)
+        save_run_json(site_key, current_scan)
+        runs = load_all_runs(site_key)
 
-    html_content = build_site_html_from_json(site_key, runs)
-    site_file = site_dir / f"{site_key}.html"
-    with open(site_file, "w", encoding="utf-8") as f:
-        f.write(html_content)
+        html_content = build_site_html_from_json(site_key, runs)
+        site_file = site_dir / f"{site_key}.html"
+        with open(site_file, "w", encoding="utf-8") as f:
+            f.write(html_content)
 
 
 def export_json():
@@ -876,6 +994,7 @@ def check_firebase_exposure(content, source_url):
         print(f"  [FIREBASE DB] {db_url}")
         add_finding("firebase_db", db_url, source_url,
                     "Firebase database URL detected — verify rules manually")
+        probe_firebase_db(db_url, source_url)
 
     for m in re.finditer(ADVANCED_PATTERNS['firebase_storage'], content, re.IGNORECASE):
         add_finding("firebase_storage", m.group(0), source_url,
@@ -892,6 +1011,23 @@ def check_firebase_exposure(content, source_url):
             continue
         supabase_urls.add(su)
         add_finding("supabase_url", su, source_url, "Supabase project URL detected")
+
+
+def probe_firebase_db(db_url, source_url):
+    if not PROBE_FIREBASE or not HAS_AUTH_FIREBASE:
+        return
+    try:
+        BUCKET.consume()
+        with RATE_LIMIT:
+            r = SESSION.get(db_url.rstrip('/') + '/.json',
+                            headers={'User-Agent': random.choice(USER_AGENTS)},
+                            timeout=5, verify=VERIFY_SSL)
+        if r.status_code == 200 and r.text.strip() not in ('null', '{}', ''):
+            print(f"  [FIREBASE OPEN] {db_url} returns data")
+            add_finding("firebase_open_db", db_url, source_url,
+                        "Firebase RTDB is publicly readable")
+    except Exception:
+        pass
 
 
 def check_cors(target_url):
@@ -942,11 +1078,13 @@ def check_graphql_introspection(base_url, content=""):
         if is_excluded(gql_url) or not is_safe_url(gql_url):
             continue
         try:
-            r = SESSION.post(gql_url,
-                             json={"query": "{__schema{types{name}}}"},
-                             timeout=6, verify=VERIFY_SSL,
-                             headers={'Content-Type': 'application/json',
-                                      'User-Agent': random.choice(USER_AGENTS)})
+            BUCKET.consume()
+            with RATE_LIMIT:
+                r = SESSION.post(gql_url,
+                                 json={"query": "{__schema{types{name}}}"},
+                                 timeout=6, verify=VERIFY_SSL,
+                                 headers={'Content-Type': 'application/json',
+                                          'User-Agent': random.choice(USER_AGENTS)})
             if r.status_code == 200 and '__schema' in r.text:
                 add_finding("graphql_introspection_enabled", gql_url, "",
                             "GraphQL introspection is enabled - full schema exposed")
@@ -987,7 +1125,7 @@ def classify_endpoint_risk(ep):
 
 
 def validate_secret(finding_type, value):
-    if not VALIDATE_SECRETS:
+    if not VALIDATE_SECRETS or not HAS_AUTHORIZATION:
         return None
     try:
         if finding_type == 'github_token':
@@ -1104,6 +1242,8 @@ def analyze_javascript(file_url, content=None):
         for c in chunks:
             full = urljoin(file_url, c)
             if is_excluded(full) or not is_safe_url(full):
+                continue
+            if not is_same_target(full, file_url):
                 continue
             r = fetch_with_backoff(full, retries=1, timeout=8)
             if r and r.status_code == 200:
@@ -1275,8 +1415,10 @@ def run_initial_analysis(target_url, target_files):
     if res and res.status_code == 200:
         soup = BeautifulSoup(res.text, HTML_PARSER)
         scan_inline_scripts(soup, target_url)
-        check_cors(target_url)
-        check_graphql_introspection(target_url, res.text)
+        if ENABLE_CORS:
+            check_cors(target_url)
+        if ENABLE_GRAPHQL:
+            check_graphql_introspection(target_url, res.text)
         check_security_headers(target_url, res)
     save_site_files()
 
@@ -1308,7 +1450,7 @@ def check_common_paths(base_url):
             pass
         return None
 
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         results = executor.map(check_one_path, COMMON_PATHS)
         for result in results:
             if result:
@@ -1328,7 +1470,7 @@ def extract_file_refs(text, base_url):
     return refs
 
 
-def crawl_bfs(seeds, max_depth=2, max_files=500, batch=20):
+def crawl_bfs(seeds, max_depth=2, max_files=500, batch=20, target_url=None):
     seen = set(seeds)
     queue = deque((s, 0) for s in seeds)
     results = set(seeds)
@@ -1351,7 +1493,7 @@ def crawl_bfs(seeds, max_depth=2, max_files=500, batch=20):
         if not level:
             break
 
-        with ThreadPoolExecutor(max_workers=min(batch, 15)) as ex:
+        with ThreadPoolExecutor(max_workers=min(batch, MAX_WORKERS)) as ex:
             futures = {ex.submit(fetch_text, u): (u, d) for u, d in level}
             for fut in as_completed(futures):
                 url, depth = futures[fut]
@@ -1365,6 +1507,8 @@ def crawl_bfs(seeds, max_depth=2, max_files=500, batch=20):
                     if sub in seen or len(results) >= max_files:
                         continue
                     if '.css' in sub.lower() or is_excluded(sub):
+                        continue
+                    if target_url and not is_same_target(sub, target_url):
                         continue
                     seen.add(sub)
                     results.add(sub)
@@ -1399,7 +1543,8 @@ def get_target_files(target_url):
             if not is_excluded(full):
                 target_files.add(full)
 
-        crawled = crawl_bfs(list(target_files), max_depth=2, max_files=500)
+        crawled = crawl_bfs(list(target_files), max_depth=2, max_files=500,
+                            target_url=target_url)
         target_files.update(crawled)
 
         if target_url not in target_files:
@@ -1409,7 +1554,10 @@ def get_target_files(target_url):
         for f in file_list:
             add_file(f)
 
-        check_common_paths(target_url)
+        if ENABLE_COMMON_PATHS:
+            check_common_paths(target_url)
+        else:
+            print("[*] Common paths scan skipped (config.ini: enable_common_paths_scan = no).")
 
         print(f"\n[+] Found {len(file_list)} target files:\n")
         for i, f in enumerate(file_list, 1):
@@ -1430,6 +1578,10 @@ def analyze_single_file(file_list):
     print()
     try:
         choice = int(input("Enter the number of the file: "))
+    except ValueError:
+        print("[-] Please enter a number.")
+        return
+    try:
         if 1 <= choice <= len(file_list):
             target_file = file_list[choice - 1]
             print(f"\n[+] Fetching: {target_file}")
@@ -1437,7 +1589,7 @@ def analyze_single_file(file_list):
             if res and res.status_code == 200:
                 lower = target_file.lower()
                 ctype = res.headers.get('Content-Type', '').lower()
-                if lower.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico')):
+                if ENABLE_BINARY_SCAN and lower.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico')):
                     scan_binary_content(res.content, target_file)
                 elif lower.endswith(('.html', '.htm')) or 'text/html' in ctype:
                     scan_html_file(res.text, target_file)
@@ -1489,7 +1641,7 @@ def advanced_search(file_list):
                                 f"Line {line_num}: {clean_line}")
         return file_url, local
 
-    with ThreadPoolExecutor(max_workers=15) as ex:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = [ex.submit(scan_one, f) for f in file_list]
         for fut in as_completed(futures):
             total_checked += 1
@@ -1568,7 +1720,7 @@ def analyze_all_files_optimized(file_list):
 
         lower = f_url.lower()
         ctype = res.headers.get('Content-Type', '').lower()
-        if lower.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico')):
+        if ENABLE_BINARY_SCAN and lower.endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico')):
             scan_binary_content(res.content, f_url)
         elif lower.endswith(('.html', '.htm')) or 'text/html' in ctype:
             scan_html_file(res.text, f_url)
@@ -1582,13 +1734,15 @@ def analyze_all_files_optimized(file_list):
                     full = urljoin(f_url, c)
                     if is_excluded(full) or not is_safe_url(full):
                         continue
+                    if not is_same_target(full, f_url):
+                        continue
                     rr = fetch_with_backoff(full, retries=1, timeout=8)
                     if rr and rr.status_code == 200:
                         scan_content(rr.text, full)
                 try_source_map_variants(f_url)
         return f_url, findings
 
-    workers = min(15, max(5, len(file_list)))
+    workers = min(MAX_WORKERS, max(5, len(file_list)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_url = {executor.submit(fetch_and_scan, f): f for f in file_list}
         for future in as_completed(future_to_url):
@@ -1631,7 +1785,7 @@ def show_paths(target_url, file_list):
         return local
 
     if file_list:
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = [executor.submit(extract_paths, f) for f in file_list]
             for future in as_completed(futures):
                 try:
@@ -1664,7 +1818,7 @@ def show_paths(target_url, file_list):
             except Exception:
                 return "ERR", path
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             results = executor.map(check_status, sorted(unique_full_paths))
             for status_code, path in results:
                 if status_code == 200:
@@ -1729,60 +1883,68 @@ def results_menu():
 if __name__ == "__main__":
     clear_screen()
     print_banner()
-    url = input("Enter target URL : ").strip()
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
+    print("\033[1;32m[*] Active configuration loaded from config.ini\033[0m")
+    print()
 
-    if not is_safe_url(url):
-        print("[-] Target URL is blocked (SSRF protection).")
-        raise SystemExit(1)
+    try:
+        url = input("Enter target URL : ").strip()
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
 
-    site_key = extract_site_key(url)
+        if not is_safe_url(url):
+            print("[-] Target URL is blocked (SSRF protection).")
+            raise SystemExit(1)
 
-    init_live(site_key, url)
-    target_files = get_target_files(url)
-    if not target_files:
-        res = fetch_with_backoff(url, retries=2, timeout=10)
-        if res and res.status_code == 200:
-            scan_html_file(res.text, url)
-            add_file(url)
+        site_key = extract_site_key(url)
 
-    run_initial_analysis(url, target_files)
+        init_live(site_key, url)
+        target_files = get_target_files(url)
+        if not target_files:
+            res = fetch_with_backoff(url, retries=2, timeout=10)
+            if res and res.status_code == 200:
+                scan_html_file(res.text, url)
+                add_file(url)
 
-    save_site_files()
+        run_initial_analysis(url, target_files)
 
-    while True:
-        print("\n----------- Options -----------")
-        print("[1] Analyze a single file")
-        print("[2] Analyze all files")
-        print("[3] Advanced custom search")
-        print("[4] Endpoint extraction")
-        print("[5] Results")
-        print("[6] Exit")
-        choice = input("Choose an option :").strip()
+        save_site_files()
 
-        if choice == '1':
-            if not target_files:
-                print("[-] No target files available.")
+        while True:
+            print("\n----------- Options -----------")
+            print("[1] Analyze a single file")
+            print("[2] Analyze all files")
+            print("[3] Advanced custom search")
+            print("[4] Endpoint extraction")
+            print("[5] Results")
+            print("[6] Exit")
+            choice = input("Choose an option :").strip()
+
+            if choice == '1':
+                if not target_files:
+                    print("[-] No target files available.")
+                else:
+                    analyze_single_file(target_files)
+            elif choice == '2':
+                if not target_files:
+                    print("[-] No target files available.")
+                else:
+                    analyze_all_files_optimized(target_files)
+            elif choice == '3':
+                if not target_files:
+                    print("[-] No target files available.")
+                else:
+                    advanced_search(target_files)
+            elif choice == '4':
+                show_paths(url, target_files)
+            elif choice == '5':
+                results_menu()
+            elif choice == '6':
+                finalize_live()
+                print("[>] Good luck, Hunter.")
+                break
             else:
-                analyze_single_file(target_files)
-        elif choice == '2':
-            if not target_files:
-                print("[-] No target files available.")
-            else:
-                analyze_all_files_optimized(target_files)
-        elif choice == '3':
-            if not target_files:
-                print("[-] No target files available.")
-            else:
-                advanced_search(target_files)
-        elif choice == '4':
-            show_paths(url, target_files)
-        elif choice == '5':
-            results_menu()
-        elif choice == '6':
-            finalize_live()
-            print("[>] Good luck, Hunter.")
-            break
-        else:
-            print("[-] Invalid choice.")
+                print("[-] Invalid choice.")
+    except KeyboardInterrupt:
+        print("\n[!] Interrupted. Saving results...")
+        finalize_live()
+        raise SystemExit(130)
